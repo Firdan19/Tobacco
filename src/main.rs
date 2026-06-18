@@ -14,8 +14,8 @@ core::arch::global_asm!(
     .global _start
 _start:
     cli
-    lea stack_top(%rip), %rsp
-    xor %rbp, %rbp
+    lea rsp, [rip + stack_top]
+    xor rbp, rbp
     call kernel_main
 
 .halt:
