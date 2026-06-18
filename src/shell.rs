@@ -82,7 +82,7 @@ fn execute(input: &[u8]) {
         serial::serial_println("clear");
         vga::show_splash();
     } else if eq_ignore_ascii_case(command, b"version") {
-        println("CloudOS v0.0.3");
+        println("CloudOS v0.0.4");
     } else if eq_ignore_ascii_case(command, b"about") {
         println("CloudOS: Sistem operasi untuk semua, tanpa perlu perangkat mahal.");
     } else if eq_ignore_ascii_case(command, b"echo") {

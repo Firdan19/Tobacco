@@ -2,12 +2,21 @@ use core::ptr::NonNull;
 use volatile::VolatilePtr;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
-const WHITE_ON_BLUE: u8 = 0x1f;
-const CURSOR_ON_BLUE: u8 = 0x71;
+const TEXT_ON_LIGHT: u8 = 0x70;
+const MUTED_ON_LIGHT: u8 = 0x78;
+const ACCENT_ON_LIGHT: u8 = 0x71;
+const BAR_COLOR: u8 = 0x17;
+const CURSOR_COLOR: u8 = 0x07;
 const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
 const CONSOLE_TOP: usize = 8;
-const INPUT_COLUMNS_PER_ROW: usize = VGA_WIDTH - 2;
+const CONSOLE_BOTTOM: usize = 23;
+const PANEL_LEFT: usize = 1;
+const PANEL_RIGHT: usize = 78;
+const CONSOLE_LEFT: usize = 3;
+const CONSOLE_RIGHT: usize = 76;
+const CONSOLE_WIDTH: usize = CONSOLE_RIGHT - CONSOLE_LEFT + 1;
+const INPUT_COLUMNS_PER_ROW: usize = CONSOLE_WIDTH - 2;
 const PROMPT: &[u8] = b"> ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,11 +42,11 @@ impl Writer {
             row: 0,
             column: 0,
             input_row: 0,
-            color_code: WHITE_ON_BLUE,
+            color_code: TEXT_ON_LIGHT,
             cursor_visible: false,
             cursor_saved: ScreenChar {
                 ascii_character: b' ',
-                color_code: WHITE_ON_BLUE,
+                color_code: TEXT_ON_LIGHT,
             },
             buffer: 0xb8000 as *mut ScreenChar,
         }
@@ -57,17 +66,22 @@ impl Writer {
 
     fn show_splash(&mut self) {
         self.clear_screen();
-        self.write_centered(2, "CloudOS");
-        self.write_centered(4, "Kernel v0.0.3 - Terminal Mini");
-        self.write_string_at(6, 2, "Commands: help clear version about echo uptime");
-        self.draw_rule(7);
-        self.set_cursor(CONSOLE_TOP, 0);
+        self.draw_status_bar();
+        self.write_centered_color(2, "CloudOS", ACCENT_ON_LIGHT);
+        self.write_centered_color(3, "Kernel v0.0.4 - Console Polish", TEXT_ON_LIGHT);
+        self.write_centered_color(
+            5,
+            "help clear version about echo uptime  |  Esc clears input",
+            MUTED_ON_LIGHT,
+        );
+        self.draw_panel();
+        self.set_cursor(CONSOLE_TOP, CONSOLE_LEFT);
     }
 
     fn start_prompt(&mut self) {
         self.hide_cursor();
 
-        if self.column != 0 {
+        if self.column != CONSOLE_LEFT {
             self.new_line();
         }
 
@@ -79,16 +93,16 @@ impl Writer {
         self.hide_cursor();
 
         let rows_needed = (input.len() / INPUT_COLUMNS_PER_ROW) + 1;
-        if self.input_row + rows_needed > VGA_HEIGHT {
-            let scroll_count = self.input_row + rows_needed - VGA_HEIGHT;
+        if self.input_row + rows_needed - 1 > CONSOLE_BOTTOM {
+            let scroll_count = self.input_row + rows_needed - 1 - CONSOLE_BOTTOM;
             for _ in 0..scroll_count {
                 self.scroll_console_up();
             }
             self.input_row = self.input_row.saturating_sub(scroll_count).max(CONSOLE_TOP);
         }
 
-        for row in self.input_row..VGA_HEIGHT {
-            self.clear_row(row);
+        for row in self.input_row..=CONSOLE_BOTTOM {
+            self.clear_console_row(row);
         }
 
         let mut remaining = input;
@@ -100,7 +114,7 @@ impl Writer {
             let take = remaining.len().min(INPUT_COLUMNS_PER_ROW);
             for (index, byte) in remaining.iter().copied().take(take).enumerate() {
                 self.write_cell(
-                    row * VGA_WIDTH + PROMPT.len() + index,
+                    row * VGA_WIDTH + CONSOLE_LEFT + PROMPT.len() + index,
                     vga_byte(byte),
                     self.color_code,
                 );
@@ -111,36 +125,36 @@ impl Writer {
             if remaining.is_empty() {
                 if take == INPUT_COLUMNS_PER_ROW {
                     row += 1;
-                    if row >= VGA_HEIGHT {
+                    if row > CONSOLE_BOTTOM {
                         self.scroll_console_up();
-                        row = VGA_HEIGHT - 1;
+                        row = CONSOLE_BOTTOM;
                         self.input_row = self.input_row.saturating_sub(1).max(CONSOLE_TOP);
                     }
                     self.write_prompt_at(row);
-                    self.set_cursor(row, PROMPT.len());
+                    self.set_cursor(row, CONSOLE_LEFT + PROMPT.len());
                 } else {
-                    self.set_cursor(row, PROMPT.len() + take);
+                    self.set_cursor(row, CONSOLE_LEFT + PROMPT.len() + take);
                 }
                 break;
             }
 
             row += 1;
-            if row >= VGA_HEIGHT {
+            if row > CONSOLE_BOTTOM {
                 self.scroll_console_up();
-                row = VGA_HEIGHT - 1;
+                row = CONSOLE_BOTTOM;
                 self.input_row = self.input_row.saturating_sub(1).max(CONSOLE_TOP);
             }
         }
     }
 
-    fn write_centered(&mut self, row: usize, s: &str) {
+    fn write_centered_color(&mut self, row: usize, s: &str, color_code: u8) {
         let width = s.bytes().count().min(VGA_WIDTH);
         let column = (VGA_WIDTH - width) / 2;
 
-        self.write_string_at(row, column, s);
+        self.write_string_at_color(row, column, s, color_code);
     }
 
-    fn write_string_at(&mut self, row: usize, column: usize, s: &str) {
+    fn write_string_at_color(&mut self, row: usize, column: usize, s: &str, color_code: u8) {
         if row >= VGA_HEIGHT || column >= VGA_WIDTH {
             return;
         }
@@ -149,23 +163,42 @@ impl Writer {
         let max_len = VGA_WIDTH - column;
 
         for (offset, byte) in s.bytes().take(max_len).enumerate() {
-            self.write_cell(start + offset, vga_byte(byte), self.color_code);
+            self.write_cell(start + offset, vga_byte(byte), color_code);
         }
     }
 
     fn write_prompt_at(&mut self, row: usize) {
         for (index, byte) in PROMPT.iter().copied().enumerate() {
-            self.write_cell(row * VGA_WIDTH + index, byte, self.color_code);
+            self.write_cell(
+                row * VGA_WIDTH + CONSOLE_LEFT + index,
+                byte,
+                ACCENT_ON_LIGHT,
+            );
         }
     }
 
-    fn draw_rule(&mut self, row: usize) {
-        if row >= VGA_HEIGHT {
-            return;
+    fn draw_status_bar(&mut self) {
+        self.clear_row_with_color(0, BAR_COLOR);
+        self.write_string_at_color(0, 2, "CloudOS Terminal", BAR_COLOR);
+        self.write_centered_color(0, "Phase 1 Console", BAR_COLOR);
+        self.write_string_at_color(0, 68, "v0.0.4", BAR_COLOR);
+    }
+
+    fn draw_panel(&mut self) {
+        for column in PANEL_LEFT..=PANEL_RIGHT {
+            self.write_cell(7 * VGA_WIDTH + column, b'-', MUTED_ON_LIGHT);
+            self.write_cell(24 * VGA_WIDTH + column, b'-', MUTED_ON_LIGHT);
         }
 
-        for column in 0..VGA_WIDTH {
-            self.write_cell(row * VGA_WIDTH + column, b'-', self.color_code);
+        self.write_cell(7 * VGA_WIDTH + PANEL_LEFT, b'+', MUTED_ON_LIGHT);
+        self.write_cell(7 * VGA_WIDTH + PANEL_RIGHT, b'+', MUTED_ON_LIGHT);
+        self.write_cell(24 * VGA_WIDTH + PANEL_LEFT, b'+', MUTED_ON_LIGHT);
+        self.write_cell(24 * VGA_WIDTH + PANEL_RIGHT, b'+', MUTED_ON_LIGHT);
+
+        for row in CONSOLE_TOP..=CONSOLE_BOTTOM {
+            self.write_cell(row * VGA_WIDTH + PANEL_LEFT, b'|', MUTED_ON_LIGHT);
+            self.write_cell(row * VGA_WIDTH + PANEL_RIGHT, b'|', MUTED_ON_LIGHT);
+            self.clear_console_row(row);
         }
     }
 
@@ -193,7 +226,11 @@ impl Writer {
             b'\n' => self.new_line(),
             8 => self.backspace(),
             byte => {
-                if self.column >= VGA_WIDTH {
+                if self.column < CONSOLE_LEFT {
+                    self.column = CONSOLE_LEFT;
+                }
+
+                if self.column > CONSOLE_RIGHT {
                     self.new_line();
                 }
 
@@ -201,7 +238,7 @@ impl Writer {
                 self.write_cell(offset, vga_byte(byte), self.color_code);
                 self.column += 1;
 
-                if self.column >= VGA_WIDTH {
+                if self.column > CONSOLE_RIGHT {
                     self.new_line();
                 }
             }
@@ -209,8 +246,8 @@ impl Writer {
     }
 
     fn new_line(&mut self) {
-        self.column = 0;
-        if self.row + 1 >= VGA_HEIGHT {
+        self.column = CONSOLE_LEFT;
+        if self.row >= CONSOLE_BOTTOM {
             self.scroll_console_up();
         } else {
             self.row += 1;
@@ -222,11 +259,11 @@ impl Writer {
     }
 
     fn backspace(&mut self) {
-        if self.column > 0 {
+        if self.column > CONSOLE_LEFT {
             self.column -= 1;
-        } else if self.row > 0 {
+        } else if self.row > CONSOLE_TOP {
             self.row -= 1;
-            self.column = VGA_WIDTH - 1;
+            self.column = CONSOLE_RIGHT;
         } else {
             return;
         }
@@ -238,8 +275,8 @@ impl Writer {
     fn scroll_console_up(&mut self) {
         self.hide_cursor();
 
-        for row in (CONSOLE_TOP + 1)..VGA_HEIGHT {
-            for column in 0..VGA_WIDTH {
+        for row in (CONSOLE_TOP + 1)..=CONSOLE_BOTTOM {
+            for column in CONSOLE_LEFT..=CONSOLE_RIGHT {
                 let from = row * VGA_WIDTH + column;
                 let to = (row - 1) * VGA_WIDTH + column;
                 let character = self.read_cell(from);
@@ -247,15 +284,25 @@ impl Writer {
             }
         }
 
-        self.clear_row(VGA_HEIGHT - 1);
-        self.row = VGA_HEIGHT - 1;
-        self.column = 0;
+        self.clear_console_row(CONSOLE_BOTTOM);
+        self.row = CONSOLE_BOTTOM;
+        self.column = CONSOLE_LEFT;
     }
 
     fn clear_row(&mut self, row: usize) {
+        self.clear_row_with_color(row, self.color_code);
+    }
+
+    fn clear_row_with_color(&mut self, row: usize, color_code: u8) {
         let start = row * VGA_WIDTH;
         for column in 0..VGA_WIDTH {
-            self.write_cell(start + column, b' ', self.color_code);
+            self.write_cell(start + column, b' ', color_code);
+        }
+    }
+
+    fn clear_console_row(&mut self, row: usize) {
+        for column in CONSOLE_LEFT..=CONSOLE_RIGHT {
+            self.write_cell(row * VGA_WIDTH + column, b' ', self.color_code);
         }
     }
 
@@ -274,7 +321,7 @@ impl Writer {
 
         let offset = self.row * VGA_WIDTH + self.column;
         self.cursor_saved = self.read_cell(offset);
-        self.write_cell(offset, b'_', CURSOR_ON_BLUE);
+        self.write_cell(offset, b'_', CURSOR_COLOR);
         self.cursor_visible = true;
     }
 
