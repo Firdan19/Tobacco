@@ -6,6 +6,7 @@ use x86_64::instructions::hlt;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 mod interrupts;
+mod keyboard;
 mod vga;
 
 core::arch::global_asm!(
@@ -119,6 +120,7 @@ pub extern "C" fn kernel_main() -> ! {
     vga::init();
     vga::show_splash();
 
+    keyboard::init();
     interrupts::init();
 
     input_loop();
@@ -134,6 +136,7 @@ fn panic(_info: &PanicInfo) -> ! {
 fn input_loop() -> ! {
     loop {
         cpu_interrupts::disable();
+        interrupts::poll_keyboard();
 
         if let Some(byte) = interrupts::pop_key() {
             cpu_interrupts::enable();

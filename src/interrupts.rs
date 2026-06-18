@@ -1,7 +1,6 @@
+use crate::{keyboard, vga};
 use core::arch::global_asm;
-use core::cell::UnsafeCell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::lidt;
@@ -22,9 +21,6 @@ const PIC_1_OFFSET: u8 = 32;
 const PIC_2_OFFSET: u8 = 40;
 const KEYBOARD_IRQ: u8 = 1;
 const KEYBOARD_VECTOR: usize = (PIC_1_OFFSET + KEYBOARD_IRQ) as usize;
-const KEYBOARD_DATA_PORT: u16 = 0x60;
-
-const KEY_BUFFER_SIZE: usize = 256;
 
 global_asm!(
     r#"
@@ -96,11 +92,29 @@ default_irq_stub:
 
     .global default_interrupt_stub
 default_interrupt_stub:
+    PUSH_REGS
+    movq %rsp, %rax
+    andq $-16, %rsp
+    subq $16, %rsp
+    movq %rax, (%rsp)
+    cld
+    call exception_handler
+    movq (%rsp), %rsp
+    POP_REGS
     iretq
 
     .global default_exception_with_error_stub
 default_exception_with_error_stub:
     addq $8, %rsp
+    PUSH_REGS
+    movq %rsp, %rax
+    andq $-16, %rsp
+    subq $16, %rsp
+    movq %rax, (%rsp)
+    cld
+    call exception_handler
+    movq (%rsp), %rsp
+    POP_REGS
     iretq
 "#
 );
@@ -117,19 +131,19 @@ unsafe extern "C" {
 struct IdtEntry {
     offset_low: u16,
     selector: u16,
-    ist: u16,
     options: u16,
     offset_mid: u16,
     offset_high: u32,
     reserved: u32,
 }
 
+const _: [(); 16] = [(); size_of::<IdtEntry>()];
+
 impl IdtEntry {
     const fn missing() -> Self {
         Self {
             offset_low: 0,
             selector: 0,
-            ist: 0,
             options: 0,
             offset_mid: 0,
             offset_high: 0,
@@ -142,7 +156,6 @@ impl IdtEntry {
 
         self.offset_low = address as u16;
         self.selector = CODE_SELECTOR;
-        self.ist = 0;
         self.options = INTERRUPT_GATE;
         self.offset_mid = (address >> 16) as u16;
         self.offset_high = (address >> 32) as u32;
@@ -150,60 +163,7 @@ impl IdtEntry {
     }
 }
 
-struct KeyBuffer {
-    buffer: UnsafeCell<[u8; KEY_BUFFER_SIZE]>,
-    read_index: AtomicUsize,
-    write_index: AtomicUsize,
-}
-
-unsafe impl Sync for KeyBuffer {}
-
-impl KeyBuffer {
-    const fn new() -> Self {
-        Self {
-            buffer: UnsafeCell::new([0; KEY_BUFFER_SIZE]),
-            read_index: AtomicUsize::new(0),
-            write_index: AtomicUsize::new(0),
-        }
-    }
-
-    fn push(&self, byte: u8) {
-        let write = self.write_index.load(Ordering::Relaxed);
-        let next_write = (write + 1) % KEY_BUFFER_SIZE;
-
-        if next_write == self.read_index.load(Ordering::Acquire) {
-            return;
-        }
-
-        unsafe {
-            let ptr = self.buffer.get().cast::<u8>().add(write);
-            ptr.write(byte);
-        }
-
-        self.write_index.store(next_write, Ordering::Release);
-    }
-
-    fn pop(&self) -> Option<u8> {
-        let read = self.read_index.load(Ordering::Relaxed);
-
-        if read == self.write_index.load(Ordering::Acquire) {
-            return None;
-        }
-
-        let byte = unsafe {
-            let ptr = self.buffer.get().cast::<u8>().add(read);
-            ptr.read()
-        };
-
-        let next_read = (read + 1) % KEY_BUFFER_SIZE;
-        self.read_index.store(next_read, Ordering::Release);
-
-        Some(byte)
-    }
-}
-
 static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
-static KEY_BUFFER: KeyBuffer = KeyBuffer::new();
 
 pub fn init() {
     cpu_interrupts::disable();
@@ -217,7 +177,11 @@ pub fn init() {
 }
 
 pub fn pop_key() -> Option<u8> {
-    KEY_BUFFER.pop()
+    keyboard::pop_key()
+}
+
+pub fn poll_keyboard() {
+    keyboard::poll();
 }
 
 unsafe fn init_idt() {
@@ -310,12 +274,7 @@ unsafe fn send_eoi(irq: u8) {
 
 #[no_mangle]
 pub extern "C" fn keyboard_interrupt_handler() {
-    let mut keyboard_port = Port::<u8>::new(KEYBOARD_DATA_PORT);
-    let scancode = unsafe { keyboard_port.read() };
-
-    if let Some(byte) = scancode_to_ascii(scancode) {
-        KEY_BUFFER.push(byte);
-    }
+    keyboard::handle_interrupt();
 
     unsafe {
         send_eoi(KEYBOARD_IRQ);
@@ -329,63 +288,11 @@ pub extern "C" fn default_irq_handler() {
     }
 }
 
-fn scancode_to_ascii(scancode: u8) -> Option<u8> {
-    if scancode & 0x80 != 0 {
-        return None;
-    }
-
-    match scancode {
-        0x02 => Some(b'1'),
-        0x03 => Some(b'2'),
-        0x04 => Some(b'3'),
-        0x05 => Some(b'4'),
-        0x06 => Some(b'5'),
-        0x07 => Some(b'6'),
-        0x08 => Some(b'7'),
-        0x09 => Some(b'8'),
-        0x0a => Some(b'9'),
-        0x0b => Some(b'0'),
-        0x0c => Some(b'-'),
-        0x0d => Some(b'='),
-        0x0e => Some(8),
-        0x0f => Some(b'\t'),
-        0x10 => Some(b'q'),
-        0x11 => Some(b'w'),
-        0x12 => Some(b'e'),
-        0x13 => Some(b'r'),
-        0x14 => Some(b't'),
-        0x15 => Some(b'y'),
-        0x16 => Some(b'u'),
-        0x17 => Some(b'i'),
-        0x18 => Some(b'o'),
-        0x19 => Some(b'p'),
-        0x1a => Some(b'['),
-        0x1b => Some(b']'),
-        0x1c => Some(b'\n'),
-        0x1e => Some(b'a'),
-        0x1f => Some(b's'),
-        0x20 => Some(b'd'),
-        0x21 => Some(b'f'),
-        0x22 => Some(b'g'),
-        0x23 => Some(b'h'),
-        0x24 => Some(b'j'),
-        0x25 => Some(b'k'),
-        0x26 => Some(b'l'),
-        0x27 => Some(b';'),
-        0x28 => Some(b'\''),
-        0x29 => Some(b'`'),
-        0x2b => Some(b'\\'),
-        0x2c => Some(b'z'),
-        0x2d => Some(b'x'),
-        0x2e => Some(b'c'),
-        0x2f => Some(b'v'),
-        0x30 => Some(b'b'),
-        0x31 => Some(b'n'),
-        0x32 => Some(b'm'),
-        0x33 => Some(b','),
-        0x34 => Some(b'.'),
-        0x35 => Some(b'/'),
-        0x39 => Some(b' '),
-        _ => None,
+#[no_mangle]
+pub extern "C" fn exception_handler() {
+    cpu_interrupts::disable();
+    vga::write_string("\nCPU fault captured. System halted.");
+    loop {
+        x86_64::instructions::hlt();
     }
 }
