@@ -2,11 +2,11 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use core::ptr::NonNull;
-use volatile::VolatilePtr;
 use x86_64::instructions::hlt;
+use x86_64::instructions::interrupts as cpu_interrupts;
 
-mod memory;
+mod interrupts;
+mod vga;
 
 core::arch::global_asm!(
     r#"
@@ -107,19 +107,32 @@ stack_top:
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
-    let vga_ptr = unsafe { NonNull::new_unchecked(0xb8000 as *mut memory::ScreenChar) };
-    let vga = unsafe { VolatilePtr::new(vga_ptr) };
+    vga::init();
+    vga::show_splash();
 
-    memory::clear_screen(vga);
-    memory::write_centered(vga, 11, "CloudOS");
-    memory::write_centered(vga, 13, "Kernel v0.0.1 - Booted");
+    interrupts::init();
 
-    halt_loop();
+    input_loop();
 }
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    cpu_interrupts::disable();
+    vga::write_string("\nPANIC");
     halt_loop();
+}
+
+fn input_loop() -> ! {
+    loop {
+        cpu_interrupts::disable();
+
+        if let Some(byte) = interrupts::pop_key() {
+            cpu_interrupts::enable();
+            vga::write_byte(byte);
+        } else {
+            cpu_interrupts::enable_and_hlt();
+        }
+    }
 }
 
 fn halt_loop() -> ! {
