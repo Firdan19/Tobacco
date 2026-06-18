@@ -4,6 +4,9 @@ use volatile::VolatilePtr;
 const WHITE_ON_BLUE: u8 = 0x1f;
 const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
+const INPUT_ROW: usize = 18;
+const INPUT_COLUMN: usize = 4;
+const PROMPT: &[u8] = b"> ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -156,8 +159,33 @@ pub fn show_splash() {
         writer.write_centered(10, "CloudOS");
         writer.write_centered(12, "Kernel v0.0.1 - Booted");
         writer.write_string_at(16, 4, "Keyboard input ready:");
-        writer.set_cursor(18, 4);
-        writer.write_string("> ");
+    });
+    render_input_line(&[]);
+}
+
+pub const fn input_capacity() -> usize {
+    VGA_WIDTH - INPUT_COLUMN - PROMPT.len()
+}
+
+pub fn render_input_line(input: &[u8]) {
+    with_writer(|writer| {
+        writer.clear_row(INPUT_ROW);
+
+        let mut column = INPUT_COLUMN;
+        for byte in PROMPT {
+            writer.write_cell(INPUT_ROW * VGA_WIDTH + column, *byte, writer.color_code);
+            column += 1;
+        }
+
+        let max_len = input_capacity();
+        for byte in input.iter().copied().take(max_len) {
+            writer.write_cell(
+                INPUT_ROW * VGA_WIDTH + column,
+                vga_byte(byte),
+                writer.color_code,
+            );
+            column += 1;
+        }
     });
 }
 

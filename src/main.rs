@@ -134,13 +134,38 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 fn input_loop() -> ! {
+    let mut input = [0u8; vga::input_capacity()];
+    let mut input_len = 0usize;
+
     loop {
         cpu_interrupts::disable();
         interrupts::poll_keyboard();
 
         if let Some(byte) = interrupts::pop_key() {
             cpu_interrupts::enable();
-            vga::write_byte(byte);
+            match byte {
+                b'\n' => {
+                    input_len = 0;
+                }
+                8 => {
+                    input_len = input_len.saturating_sub(1);
+                }
+                b'\t' => {
+                    if input_len < vga::input_capacity() {
+                        input[input_len] = b' ';
+                        input_len += 1;
+                    }
+                }
+                0x20..=0x7e => {
+                    if input_len < vga::input_capacity() {
+                        input[input_len] = byte;
+                        input_len += 1;
+                    }
+                }
+                _ => {}
+            }
+
+            vga::render_input_line(&input[..input_len]);
         } else {
             cpu_interrupts::enable_and_hlt();
         }
