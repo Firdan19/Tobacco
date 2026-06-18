@@ -120,7 +120,7 @@ stack_top:
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     serial::init();
-    serial::serial_println("CloudOS v0.0.2 booting...");
+    serial::serial_println("CloudOS v0.0.3 booting...");
 
     vga::init();
     vga::show_splash();

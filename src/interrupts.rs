@@ -1,5 +1,6 @@
 use crate::{keyboard, serial, vga};
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::lidt;
@@ -74,6 +75,7 @@ impl IdtEntry {
 }
 
 static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
+static PIT_TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     cpu_interrupts::disable();
@@ -94,6 +96,10 @@ pub fn pop_key() -> Option<u8> {
 
 pub fn poll_keyboard() {
     keyboard::poll();
+}
+
+pub fn ticks() -> u64 {
+    PIT_TICKS.load(Ordering::Acquire)
 }
 
 unsafe fn init_idt() {
@@ -199,6 +205,7 @@ unsafe fn send_eoi(irq: u8) {
 
 #[no_mangle]
 pub extern "C" fn timer_interrupt_handler() {
+    PIT_TICKS.fetch_add(1, Ordering::Relaxed);
     vga::toggle_cursor();
 
     unsafe {

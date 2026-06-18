@@ -6,6 +6,7 @@ const WHITE_ON_BLUE: u8 = 0x1f;
 const CURSOR_ON_BLUE: u8 = 0x71;
 const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
+const CONSOLE_TOP: usize = 8;
 const INPUT_COLUMNS_PER_ROW: usize = VGA_WIDTH - 2;
 const PROMPT: &[u8] = b"> ";
 
@@ -56,10 +57,11 @@ impl Writer {
 
     fn show_splash(&mut self) {
         self.clear_screen();
-        self.write_centered(10, "CloudOS");
-        self.write_centered(12, "Kernel v0.0.2 - Booted");
-        self.write_string_at(16, 4, "Keyboard input ready:");
-        self.set_cursor(18, 0);
+        self.write_centered(2, "CloudOS");
+        self.write_centered(4, "Kernel v0.0.3 - Terminal Mini");
+        self.write_string_at(6, 2, "Commands: help clear version about echo uptime");
+        self.draw_rule(7);
+        self.set_cursor(CONSOLE_TOP, 0);
     }
 
     fn start_prompt(&mut self) {
@@ -80,9 +82,9 @@ impl Writer {
         if self.input_row + rows_needed > VGA_HEIGHT {
             let scroll_count = self.input_row + rows_needed - VGA_HEIGHT;
             for _ in 0..scroll_count {
-                self.scroll_up();
+                self.scroll_console_up();
             }
-            self.input_row = self.input_row.saturating_sub(scroll_count);
+            self.input_row = self.input_row.saturating_sub(scroll_count).max(CONSOLE_TOP);
         }
 
         for row in self.input_row..VGA_HEIGHT {
@@ -110,9 +112,9 @@ impl Writer {
                 if take == INPUT_COLUMNS_PER_ROW {
                     row += 1;
                     if row >= VGA_HEIGHT {
-                        self.scroll_up();
+                        self.scroll_console_up();
                         row = VGA_HEIGHT - 1;
-                        self.input_row = self.input_row.saturating_sub(1);
+                        self.input_row = self.input_row.saturating_sub(1).max(CONSOLE_TOP);
                     }
                     self.write_prompt_at(row);
                     self.set_cursor(row, PROMPT.len());
@@ -124,9 +126,9 @@ impl Writer {
 
             row += 1;
             if row >= VGA_HEIGHT {
-                self.scroll_up();
+                self.scroll_console_up();
                 row = VGA_HEIGHT - 1;
-                self.input_row = self.input_row.saturating_sub(1);
+                self.input_row = self.input_row.saturating_sub(1).max(CONSOLE_TOP);
             }
         }
     }
@@ -154,6 +156,16 @@ impl Writer {
     fn write_prompt_at(&mut self, row: usize) {
         for (index, byte) in PROMPT.iter().copied().enumerate() {
             self.write_cell(row * VGA_WIDTH + index, byte, self.color_code);
+        }
+    }
+
+    fn draw_rule(&mut self, row: usize) {
+        if row >= VGA_HEIGHT {
+            return;
+        }
+
+        for column in 0..VGA_WIDTH {
+            self.write_cell(row * VGA_WIDTH + column, b'-', self.color_code);
         }
     }
 
@@ -199,9 +211,13 @@ impl Writer {
     fn new_line(&mut self) {
         self.column = 0;
         if self.row + 1 >= VGA_HEIGHT {
-            self.scroll_up();
+            self.scroll_console_up();
         } else {
             self.row += 1;
+        }
+
+        if self.row < CONSOLE_TOP {
+            self.row = CONSOLE_TOP;
         }
     }
 
@@ -219,10 +235,10 @@ impl Writer {
         self.write_cell(offset, b' ', self.color_code);
     }
 
-    fn scroll_up(&mut self) {
+    fn scroll_console_up(&mut self) {
         self.hide_cursor();
 
-        for row in 1..VGA_HEIGHT {
+        for row in (CONSOLE_TOP + 1)..VGA_HEIGHT {
             for column in 0..VGA_WIDTH {
                 let from = row * VGA_WIDTH + column;
                 let to = (row - 1) * VGA_WIDTH + column;

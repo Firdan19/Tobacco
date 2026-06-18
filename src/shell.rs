@@ -2,6 +2,7 @@ use crate::{interrupts, serial, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
+const PIT_HZ: u64 = 18;
 
 pub fn run() -> ! {
     let mut input = [0u8; INPUT_BUFFER_SIZE];
@@ -31,21 +32,16 @@ pub fn run() -> ! {
                         vga::render_input(&input[..input_len]);
                     }
                 }
+                27 => {
+                    input_len = 0;
+                    serial::serial_println("^esc");
+                    vga::render_input(&input[..input_len]);
+                }
                 b'\t' => {
-                    if input_len < INPUT_BUFFER_SIZE {
-                        input[input_len] = b' ';
-                        input_len += 1;
-                        serial::write_byte(b' ');
-                        vga::render_input(&input[..input_len]);
-                    }
+                    push_input_byte(&mut input, &mut input_len, b' ');
                 }
                 0x20..=0x7e => {
-                    if input_len < INPUT_BUFFER_SIZE {
-                        input[input_len] = byte;
-                        input_len += 1;
-                        serial::write_byte(byte);
-                        vga::render_input(&input[..input_len]);
-                    }
+                    push_input_byte(&mut input, &mut input_len, byte);
                 }
                 _ => {}
             }
@@ -55,35 +51,109 @@ pub fn run() -> ! {
     }
 }
 
+fn push_input_byte(input: &mut [u8; INPUT_BUFFER_SIZE], input_len: &mut usize, byte: u8) {
+    if *input_len >= INPUT_BUFFER_SIZE {
+        return;
+    }
+
+    input[*input_len] = byte;
+    *input_len += 1;
+    serial::write_byte(byte);
+    vga::render_input(&input[..*input_len]);
+}
+
 fn prompt() {
     serial::serial_print("> ");
     vga::start_prompt();
 }
 
 fn execute(input: &[u8]) {
-    let command = trim_ascii(input);
+    let command_line = trim_ascii(input);
 
-    if command.is_empty() {
+    if command_line.is_empty() {
         return;
     }
 
-    if command == b"help" {
-        println("help clear version about");
-    } else if command == b"clear" {
+    let (command, arguments) = split_command(command_line);
+
+    if eq_ignore_ascii_case(command, b"help") {
+        println("help clear version about echo uptime");
+    } else if eq_ignore_ascii_case(command, b"clear") {
         serial::serial_println("clear");
         vga::show_splash();
-    } else if command == b"version" {
-        println("CloudOS v0.0.2");
-    } else if command == b"about" {
+    } else if eq_ignore_ascii_case(command, b"version") {
+        println("CloudOS v0.0.3");
+    } else if eq_ignore_ascii_case(command, b"about") {
         println("CloudOS: Sistem operasi untuk semua, tanpa perlu perangkat mahal.");
+    } else if eq_ignore_ascii_case(command, b"echo") {
+        print_ascii_line(arguments);
+    } else if eq_ignore_ascii_case(command, b"uptime") {
+        print("uptime ticks: ");
+        print_u64(interrupts::ticks());
+        print(" (~");
+        print_u64(interrupts::ticks() / PIT_HZ);
+        println("s)");
     } else {
         println("Perintah tidak dikenal. Ketik help.");
     }
 }
 
+fn split_command(input: &[u8]) -> (&[u8], &[u8]) {
+    for index in 0..input.len() {
+        if input[index] == b' ' || input[index] == b'\t' {
+            let command = &input[..index];
+            let arguments = trim_ascii(&input[(index + 1)..]);
+            return (command, arguments);
+        }
+    }
+
+    (input, &[])
+}
+
 fn println(s: &str) {
-    vga::write_line(s);
-    serial::serial_println(s);
+    print(s);
+    newline();
+}
+
+fn print(s: &str) {
+    vga::write_string(s);
+    serial::serial_print(s);
+}
+
+fn print_ascii_line(bytes: &[u8]) {
+    for byte in bytes.iter().copied() {
+        vga::write_byte(byte);
+        serial::write_byte(byte);
+    }
+
+    newline();
+}
+
+fn newline() {
+    vga::write_byte(b'\n');
+    serial::serial_println("");
+}
+
+fn print_u64(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+
+    if value == 0 {
+        vga::write_byte(b'0');
+        serial::write_byte(b'0');
+        return;
+    }
+
+    while value > 0 {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+
+    for byte in digits[index..].iter().copied() {
+        vga::write_byte(byte);
+        serial::write_byte(byte);
+    }
 }
 
 fn trim_ascii(mut input: &[u8]) -> &[u8] {
@@ -104,4 +174,26 @@ fn trim_ascii(mut input: &[u8]) -> &[u8] {
     }
 
     input
+}
+
+fn eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    for index in 0..left.len() {
+        if to_ascii_lower(left[index]) != to_ascii_lower(right[index]) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn to_ascii_lower(byte: u8) -> u8 {
+    if byte.is_ascii_uppercase() {
+        byte + 32
+    } else {
+        byte
+    }
 }

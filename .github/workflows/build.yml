@@ -18,7 +18,7 @@ jobs:
       - name: Install GRUB ISO tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y grub-pc-bin xorriso mtools nasm
+          sudo apt-get install -y grub-pc-bin xorriso mtools nasm qemu-system-x86
       - name: Assemble interrupt stubs
         run: |
           mkdir -p target
@@ -31,6 +31,16 @@ jobs:
           cp grub.cfg iso/boot/grub/grub.cfg
       - name: Create GRUB Multiboot2 ISO
         run: grub-mkrescue -o cloudos.iso iso
+      - name: Smoke test ISO boot
+        run: |
+          set +e
+          timeout 8s qemu-system-x86_64 -boot d -cdrom cloudos.iso -display none -serial file:serial.log -no-reboot -no-shutdown
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            exit "$status"
+          fi
+          grep -q "CloudOS v0.0.3 booting..." serial.log
       - uses: actions/upload-artifact@v4
         with:
           name: cloudos-iso

@@ -149,6 +149,7 @@ fn scancode_to_ascii(scancode: u8) -> Option<u8> {
     let caps = CAPS_LOCK.load(Ordering::Acquire);
 
     match scancode {
+        0x01 => Some(27),
         0x02 => Some(if shifted { b'!' } else { b'1' }),
         0x03 => Some(if shifted { b'@' } else { b'2' }),
         0x04 => Some(if shifted { b'#' } else { b'3' }),
