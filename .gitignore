@@ -5,3 +5,4 @@ bootimage.bin
 cloudos.iso
 cloudos-bootimage.zip
 cloudos-iso.zip
+qemu-debug.log

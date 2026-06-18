@@ -71,6 +71,15 @@ long_mode_start:
     movw %ax, %fs
     movw %ax, %gs
 
+    movq %cr0, %rax
+    andq $-5, %rax
+    orq $0x2, %rax
+    movq %rax, %cr0
+
+    movq %cr4, %rax
+    orq $0x600, %rax
+    movq %rax, %cr4
+
     leaq stack_top(%rip), %rsp
     xorq %rbp, %rbp
     call kernel_main
