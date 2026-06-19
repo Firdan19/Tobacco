@@ -30,12 +30,12 @@ const COMMANDS: [Command; 10] = [
     },
     Command {
         name: "version",
-        description: "tampilkan versi CloudOS",
+        description: "tampilkan versi Tobacco",
         handler: command_version,
     },
     Command {
         name: "about",
-        description: "tampilkan visi singkat CloudOS",
+        description: "tampilkan visi singkat Tobacco",
         handler: command_about,
     },
     Command {
@@ -357,11 +357,11 @@ fn command_clear(_arguments: &[u8]) {
 }
 
 fn command_version(_arguments: &[u8]) {
-    println("CloudOS v0.0.5");
+    println("Tobacco v0.0.5");
 }
 
 fn command_about(_arguments: &[u8]) {
-    println("CloudOS: Sistem operasi untuk semua, tanpa perlu perangkat mahal.");
+    println("Tobacco: Sistem operasi untuk semua, tanpa perlu perangkat mahal.");
 }
 
 fn command_echo(arguments: &[u8]) {
@@ -378,7 +378,7 @@ fn command_uptime(_arguments: &[u8]) {
 }
 
 fn command_sysinfo(_arguments: &[u8]) {
-    println("CloudOS system info:");
+    println("Tobacco system info:");
     println("  version   : v0.0.5");
     println("  arch      : x86_64 long mode");
     println("  boot      : GRUB Multiboot2 ISO");
@@ -389,7 +389,7 @@ fn command_sysinfo(_arguments: &[u8]) {
 }
 
 fn command_mem(_arguments: &[u8]) {
-    println("CloudOS memory info:");
+    println("Tobacco memory info:");
     print("  kernel base       : ");
     print_hex_u64(KERNEL_LOAD_BASE);
     newline();

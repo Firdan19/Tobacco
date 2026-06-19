@@ -2,8 +2,8 @@
 target/
 iso/
 bootimage.bin
-cloudos.iso
-cloudos-bootimage.zip
-cloudos-iso.zip
+tobacco.iso
+tobacco-bootimage.zip
+tobacco-iso.zip
 qemu-debug.log
 *.log

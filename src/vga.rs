@@ -69,8 +69,8 @@ impl Writer {
     fn show_splash(&mut self) {
         self.clear_screen();
         self.draw_status_bar();
-        self.write_centered_color(2, "CloudOS", ACCENT_ON_LIGHT);
-        self.write_centered_color(3, "Kernel v0.0.5 - Shell Line Editor", TEXT_ON_LIGHT);
+        self.write_centered_color(2, "Tobacco", ACCENT_ON_LIGHT);
+        self.write_centered_color(3, "Kernel v0.0.5 - Booted", TEXT_ON_LIGHT);
         self.write_centered_color(
             5,
             "Type help for commands  |  Up/Down history  |  Esc clears input",
@@ -87,7 +87,7 @@ impl Writer {
             self.write_cell(offset, b' ', PANIC_BACKGROUND);
         }
 
-        self.write_centered_color(2, "CloudOS", PANIC_BACKGROUND);
+        self.write_centered_color(2, "Tobacco", PANIC_BACKGROUND);
         self.write_centered_color(3, "KERNEL PANIC", PANIC_BACKGROUND);
 
         self.fill_rect(5, 6, 19, 73, PANIC_PANEL);
@@ -102,7 +102,7 @@ impl Writer {
         self.write_string_at_color(
             16,
             10,
-            "CloudOS stopped to protect kernel state.",
+            "Tobacco stopped to protect kernel state.",
             PANIC_PANEL,
         );
         self.write_centered_color(21, "No host disk was touched.", PANIC_BACKGROUND);
@@ -219,7 +219,7 @@ impl Writer {
 
     fn draw_status_bar(&mut self) {
         self.clear_row_with_color(0, BAR_COLOR);
-        self.write_string_at_color(0, 2, "CloudOS Terminal", BAR_COLOR);
+        self.write_string_at_color(0, 2, "Tobacco Terminal", BAR_COLOR);
         self.write_centered_color(0, "Phase 1 Console", BAR_COLOR);
         self.write_string_at_color(0, 68, "v0.0.5", BAR_COLOR);
     }

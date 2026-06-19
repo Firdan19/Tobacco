@@ -1,6 +1,6 @@
 # Safe QEMU Testing
 
-CloudOS should only be tested inside QEMU on this machine.
+Tobacco should only be tested inside QEMU on this machine.
 
 Safest command for a borrowed laptop because it does not grab the mouse:
 
@@ -11,7 +11,7 @@ Safest command for a borrowed laptop because it does not grab the mouse:
 GUI command:
 
 ```sh
-qemu-system-x86_64 -boot d -cdrom cloudos.iso -usb -device usb-tablet -no-reboot -no-shutdown
+qemu-system-x86_64 -boot d -cdrom tobacco.iso -usb -device usb-tablet -no-reboot -no-shutdown
 ```
 
 Safety rules:
@@ -23,4 +23,4 @@ Safety rules:
 - Close the QEMU window to stop the virtual machine.
 - Prefer `scripts/run-qemu-terminal.sh` when testing keyboard input because it uses the terminal instead of a Cocoa window.
 
-The `-cdrom cloudos.iso` option makes QEMU read only the ISO file. It does not boot from, write to, or repartition the laptop disk.
+The `-cdrom tobacco.iso` option makes QEMU read only the ISO file. It does not boot from, write to, or repartition the laptop disk.

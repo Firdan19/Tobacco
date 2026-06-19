@@ -1,5 +1,5 @@
 [package]
-name = "cloudos-kernel"
+name = "tobacco-kernel"
 version = "0.0.5"
 edition = "2021"
 
