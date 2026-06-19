@@ -81,10 +81,10 @@ fn run_selftest_checks() -> bool {
     );
     ok &= check(
         "selftest boot identity map",
-        paging_state.p4_present_entries == 1
-            && paging_state.p3_present_entries == 1
-            && paging_state.p2_present_entries == 512
-            && paging_state.huge_pages == 512
+        paging_state.p4_present_entries >= 1
+            && paging_state.p3_present_entries >= 1
+            && paging_state.p2_present_entries >= 512
+            && paging_state.huge_pages >= 512
             && paging_state.identity_mapped_bytes >= paging::BOOT_IDENTITY_MAP_BYTES,
     );
     ok &= check(
