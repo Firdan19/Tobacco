@@ -6,6 +6,45 @@ const INPUT_BUFFER_SIZE: usize = 512;
 const HISTORY_SIZE: usize = 16;
 const PIT_HZ: u64 = 18;
 
+struct Command {
+    name: &'static str,
+    description: &'static str,
+    handler: fn(&[u8]),
+}
+
+const COMMANDS: [Command; 6] = [
+    Command {
+        name: "help",
+        description: "tampilkan daftar command",
+        handler: command_help,
+    },
+    Command {
+        name: "clear",
+        description: "bersihkan layar terminal",
+        handler: command_clear,
+    },
+    Command {
+        name: "version",
+        description: "tampilkan versi CloudOS",
+        handler: command_version,
+    },
+    Command {
+        name: "about",
+        description: "tampilkan visi singkat CloudOS",
+        handler: command_about,
+    },
+    Command {
+        name: "echo",
+        description: "cetak ulang teks",
+        handler: command_echo,
+    },
+    Command {
+        name: "uptime",
+        description: "tampilkan tick PIT sejak boot",
+        handler: command_uptime,
+    },
+];
+
 struct CommandHistory {
     entries: [[u8; INPUT_BUFFER_SIZE]; HISTORY_SIZE],
     lengths: [usize; HISTORY_SIZE],
@@ -268,26 +307,51 @@ fn execute(input: &[u8]) {
     serial::serial_print_bytes(command);
     serial::serial_println("");
 
-    if eq_ignore_ascii_case(command, b"help") {
-        println("help clear version about echo uptime");
-    } else if eq_ignore_ascii_case(command, b"clear") {
-        serial::serial_println("clear");
-        vga::show_splash();
-    } else if eq_ignore_ascii_case(command, b"version") {
-        println("CloudOS v0.0.5");
-    } else if eq_ignore_ascii_case(command, b"about") {
-        println("CloudOS: Sistem operasi untuk semua, tanpa perlu perangkat mahal.");
-    } else if eq_ignore_ascii_case(command, b"echo") {
-        print_ascii_line(arguments);
-    } else if eq_ignore_ascii_case(command, b"uptime") {
-        print("uptime ticks: ");
-        print_u64(interrupts::ticks());
-        print(" (~");
-        print_u64(interrupts::ticks() / PIT_HZ);
-        println("s)");
-    } else {
-        println("Perintah tidak dikenal. Ketik help.");
+    for command_entry in COMMANDS.iter() {
+        if eq_ignore_ascii_case(command, command_entry.name.as_bytes()) {
+            (command_entry.handler)(arguments);
+            return;
+        }
     }
+
+    println("Perintah tidak dikenal. Ketik help.");
+}
+
+fn command_help(_arguments: &[u8]) {
+    println("Commands:");
+
+    for command in COMMANDS.iter() {
+        print("  ");
+        print(command.name);
+        print_spaces(8usize.saturating_sub(command.name.len()));
+        print("- ");
+        println(command.description);
+    }
+}
+
+fn command_clear(_arguments: &[u8]) {
+    serial::serial_println("clear");
+    vga::show_splash();
+}
+
+fn command_version(_arguments: &[u8]) {
+    println("CloudOS v0.0.5");
+}
+
+fn command_about(_arguments: &[u8]) {
+    println("CloudOS: Sistem operasi untuk semua, tanpa perlu perangkat mahal.");
+}
+
+fn command_echo(arguments: &[u8]) {
+    print_ascii_line(arguments);
+}
+
+fn command_uptime(_arguments: &[u8]) {
+    print("uptime ticks: ");
+    print_u64(interrupts::ticks());
+    print(" (~");
+    print_u64(interrupts::ticks() / PIT_HZ);
+    println("s)");
 }
 
 fn split_command(input: &[u8]) -> (&[u8], &[u8]) {
@@ -310,6 +374,13 @@ fn println(s: &str) {
 fn print(s: &str) {
     vga::write_string(s);
     serial::serial_print(s);
+}
+
+fn print_spaces(count: usize) {
+    for _ in 0..count {
+        vga::write_byte(b' ');
+        serial::write_byte(b' ');
+    }
 }
 
 fn print_ascii_line(bytes: &[u8]) {
