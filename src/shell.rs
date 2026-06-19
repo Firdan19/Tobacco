@@ -1,5 +1,5 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{gdt, interrupts, klog, multiboot, paging, physmem, serial, stats, vga};
+use crate::{gdt, heap, interrupts, klog, multiboot, paging, physmem, serial, stats, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -16,7 +16,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 24] = [
+const COMMANDS: [Command; 26] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -108,9 +108,19 @@ const COMMANDS: [Command; 24] = [
         handler: command_paging,
     },
     Command {
+        name: "heap",
+        description: "status kernel heap",
+        handler: command_heap,
+    },
+    Command {
         name: "virt",
         description: "translate virtual address",
         handler: command_virt,
+    },
+    Command {
+        name: "vmtest",
+        description: "uji map/unmap virtual page",
+        handler: command_vmtest,
     },
     Command {
         name: "log",
@@ -476,6 +486,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  boot info : Multiboot2 parser + memory map");
     println("  memory    : physical frame allocator");
     println("  paging    : boot identity map inspector");
+    println("  vmm       : high-half mapper, guard pages, heap");
     println("  gdt/tss   : double fault IST stack");
     println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
@@ -489,6 +500,7 @@ fn command_mem(_arguments: &[u8]) {
     let boot_info = multiboot::summary();
     let memory = boot_info.memory;
     let frames = physmem::snapshot();
+    let heap_snapshot = heap::snapshot();
 
     println("Tobacco memory info:");
     print("  kernel start      : ");
@@ -575,6 +587,11 @@ fn command_mem(_arguments: &[u8]) {
     print("  free              : ");
     print_u64(frames.free_frames);
     println(" frame(s)");
+    print("  kernel heap       : ");
+    print_bytes(heap_snapshot.size);
+    print(" / used ");
+    print_bytes(heap_snapshot.used);
+    newline();
 }
 
 fn command_memmap(_arguments: &[u8]) {
@@ -625,6 +642,8 @@ fn command_frames(_arguments: &[u8]) {
     print_counter("total usable", frames.total_usable_frames);
     print_counter("allocatable", frames.allocatable_frames);
     print_counter("allocated", frames.allocated_frames);
+    print_counter("recycled", frames.recycled_frames);
+    print_counter("recycle cap", frames.recycled_capacity);
     print_counter("free", frames.free_frames);
     print_counter("skipped", frames.skipped_frames);
     print("  next frame        : ");
@@ -648,8 +667,11 @@ fn command_frame(_arguments: &[u8]) {
     match physmem::allocate_frame() {
         Some(frame) => {
             serial::log_u64("mem", "allocated frame", frame);
-            print("allocated frame: ");
+            print("allocated test frame: ");
             print_hex_u64(frame);
+            newline();
+            print("recycled back: ");
+            print_on_off(physmem::free_frame(frame));
             newline();
         }
         None => {
@@ -720,6 +742,7 @@ fn command_boot(_arguments: &[u8]) {
     let frames = physmem::snapshot();
     let gdt = gdt::snapshot();
     let paging = paging::snapshot();
+    let heap_snapshot = heap::snapshot();
     let log = klog::snapshot();
 
     println("Boot status:");
@@ -759,6 +782,12 @@ fn command_boot(_arguments: &[u8]) {
     newline();
     print("  paging        : ");
     print_on_off(paging.initialized);
+    newline();
+    print("  vm mapper     : ");
+    print_on_off(paging.mapper_initialized);
+    newline();
+    print("  kernel heap   : ");
+    print_on_off(heap_snapshot.initialized);
     newline();
     print("  kernel log    : ");
     print_on_off(log.initialized);
@@ -831,6 +860,53 @@ fn command_paging(_arguments: &[u8]) {
     print("  page table memory : ");
     print_bytes(snapshot.page_table_bytes);
     newline();
+    print("  vm mapper         : ");
+    print_on_off(snapshot.mapper_initialized);
+    newline();
+    print_counter("mapped pages", snapshot.mapped_pages);
+    print_counter("unmapped pages", snapshot.unmapped_pages);
+    print_counter("page table frames", snapshot.page_table_frames);
+    print_counter("guard pages", snapshot.guard_pages);
+    print("  managed start     : ");
+    print_hex_u64(paging::KERNEL_VIRTUAL_BASE);
+    newline();
+    print("  managed end       : ");
+    print_hex_u64(paging::KERNEL_VIRTUAL_END);
+    newline();
+}
+
+fn command_heap(_arguments: &[u8]) {
+    let snapshot = heap::snapshot();
+
+    println("Kernel heap:");
+    print("  initialized       : ");
+    print_on_off(snapshot.initialized);
+    newline();
+    print("  base              : ");
+    print_hex_u64(snapshot.base);
+    newline();
+    print("  size              : ");
+    print_bytes(snapshot.size);
+    newline();
+    print("  used              : ");
+    print_bytes(snapshot.used);
+    newline();
+    print("  remaining         : ");
+    print_bytes(snapshot.remaining);
+    newline();
+    print_counter("mapped pages", snapshot.mapped_pages);
+    print_counter("allocations", snapshot.allocations);
+    print_counter("failed alloc", snapshot.failed_allocations);
+    print("  guard low         : ");
+    print_hex_u64(snapshot.guard_low);
+    print(" ");
+    print_on_off(!paging::translate(snapshot.guard_low).mapped);
+    newline();
+    print("  guard high        : ");
+    print_hex_u64(snapshot.guard_high);
+    print(" ");
+    print_on_off(!paging::translate(snapshot.guard_high).mapped);
+    newline();
 }
 
 fn command_virt(arguments: &[u8]) {
@@ -869,6 +945,28 @@ fn command_virt(arguments: &[u8]) {
             stats::inc_shell_error();
             println("Alamat tidak valid. Gunakan decimal atau hex, contoh: virt 0xb8000");
         }
+    }
+}
+
+fn command_vmtest(_arguments: &[u8]) {
+    println("Virtual memory map/unmap test:");
+
+    if paging::translate(paging::KERNEL_VM_TEST_PAGE).mapped {
+        println("  test page sudah terpakai.");
+        stats::inc_shell_error();
+        return;
+    }
+
+    if paging::probe_map_unmap(paging::KERNEL_VM_TEST_PAGE) {
+        serial::log("paging", "vmtest passed");
+        print("  page              : ");
+        print_hex_u64(paging::KERNEL_VM_TEST_PAGE);
+        newline();
+        println("  status            : PASS");
+    } else {
+        serial::log("paging", "vmtest failed");
+        stats::inc_shell_error();
+        println("  status            : FAIL");
     }
 }
 
@@ -911,6 +1009,7 @@ fn command_selftest(_arguments: &[u8]) {
     let vga_translation = paging::translate(VGA_BUFFER_ADDRESS);
     let high_translation = paging::translate(0xffff_8000_0000_0000);
     let gdt = gdt::snapshot();
+    let heap_snapshot = heap::snapshot();
     let log = klog::snapshot();
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
@@ -953,7 +1052,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "paging initialized",
-        paging_state.initialized && paging_state.cr3 != 0,
+        paging_state.initialized && paging_state.mapper_initialized && paging_state.cr3 != 0,
         &mut passed,
         &mut failed,
     );
@@ -981,6 +1080,23 @@ fn command_selftest(_arguments: &[u8]) {
         &mut passed,
         &mut failed,
     );
+    selftest_check(
+        "virtual map unmap",
+        paging::probe_map_unmap(paging::KERNEL_VM_TEST_PAGE),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "heap initialized",
+        heap_snapshot.initialized
+            && heap_snapshot.mapped_pages == heap::HEAP_PAGES
+            && heap_snapshot.remaining <= heap_snapshot.size
+            && !paging::translate(heap_snapshot.guard_low).mapped
+            && !paging::translate(heap_snapshot.guard_high).mapped,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check("heap probe", heap::probe(), &mut passed, &mut failed);
     selftest_check(
         "gdt tss ist ready",
         gdt.loaded
@@ -1023,7 +1139,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 24,
+        COMMANDS.len() >= 26,
         &mut passed,
         &mut failed,
     );

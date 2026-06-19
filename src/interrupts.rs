@@ -1,5 +1,5 @@
 use crate::keyboard::KeyEvent;
-use crate::{gdt, keyboard, serial, stats, vga};
+use crate::{gdt, keyboard, paging, serial, stats, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -308,6 +308,10 @@ pub extern "C" fn exception_dispatch_handler(context: *const ExceptionContext) -
 
     if context.vector == 14 {
         serial::log_hex_u64("panic", "cr2", fault_address);
+        serial::log(
+            "panic",
+            paging::fault_policy(fault_address, context.error_code),
+        );
         log_page_fault_bits(context.error_code);
     }
 

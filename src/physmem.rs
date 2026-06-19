@@ -4,6 +4,7 @@ use core::cell::UnsafeCell;
 pub const FRAME_SIZE: u64 = 4096;
 
 const MAX_ALLOC_REGIONS: usize = 16;
+const MAX_RECYCLED_FRAMES: usize = 128;
 const MIN_ALLOC_ADDR: u64 = 0x0010_0000;
 
 unsafe extern "C" {
@@ -36,6 +37,8 @@ pub struct Snapshot {
     pub total_usable_frames: u64,
     pub allocatable_frames: u64,
     pub allocated_frames: u64,
+    pub recycled_frames: u64,
+    pub recycled_capacity: u64,
     pub skipped_frames: u64,
     pub free_frames: u64,
     pub next_frame: u64,
@@ -55,6 +58,8 @@ impl Snapshot {
             total_usable_frames: 0,
             allocatable_frames: 0,
             allocated_frames: 0,
+            recycled_frames: 0,
+            recycled_capacity: MAX_RECYCLED_FRAMES as u64,
             skipped_frames: 0,
             free_frames: 0,
             next_frame: 0,
@@ -76,6 +81,8 @@ struct FrameAllocator {
     total_usable_frames: u64,
     allocatable_frames: u64,
     allocated_frames: u64,
+    recycled_frames: [u64; MAX_RECYCLED_FRAMES],
+    recycled_count: usize,
     skipped_frames: u64,
     last_allocated_frame: u64,
     kernel_start: u64,
@@ -95,6 +102,8 @@ impl FrameAllocator {
             total_usable_frames: 0,
             allocatable_frames: 0,
             allocated_frames: 0,
+            recycled_frames: [0; MAX_RECYCLED_FRAMES],
+            recycled_count: 0,
             skipped_frames: 0,
             last_allocated_frame: 0,
             kernel_start: 0,
@@ -181,6 +190,16 @@ impl FrameAllocator {
             self.init();
         }
 
+        if self.recycled_count > 0 {
+            self.recycled_count -= 1;
+            let frame = self.recycled_frames[self.recycled_count];
+            self.recycled_frames[self.recycled_count] = 0;
+            self.allocated_frames += 1;
+            self.last_allocated_frame = frame;
+            self.exhausted = false;
+            return Some(frame);
+        }
+
         while self.current_region < self.region_count {
             let region = self.regions[self.current_region];
 
@@ -206,6 +225,53 @@ impl FrameAllocator {
         None
     }
 
+    fn free_frame(&mut self, frame: u64) -> bool {
+        if !self.initialized {
+            self.init();
+        }
+
+        if !is_frame_aligned(frame) || frame < self.protected_until || !self.is_issued_frame(frame)
+        {
+            return false;
+        }
+
+        if self.recycled_count >= MAX_RECYCLED_FRAMES {
+            return false;
+        }
+
+        for index in 0..self.recycled_count {
+            if self.recycled_frames[index] == frame {
+                return false;
+            }
+        }
+
+        self.recycled_frames[self.recycled_count] = frame;
+        self.recycled_count += 1;
+        self.allocated_frames = self.allocated_frames.saturating_sub(1);
+        self.exhausted = false;
+
+        true
+    }
+
+    fn is_issued_frame(&self, frame: u64) -> bool {
+        for index in 0..self.region_count {
+            let region = self.regions[index];
+            if frame >= region.start && frame < region.end {
+                if index < self.current_region {
+                    return true;
+                }
+
+                if index == self.current_region {
+                    return frame < self.next_frame;
+                }
+
+                return false;
+            }
+        }
+
+        false
+    }
+
     fn snapshot(&self) -> Snapshot {
         let free_frames = self
             .allocatable_frames
@@ -219,6 +285,8 @@ impl FrameAllocator {
             total_usable_frames: self.total_usable_frames,
             allocatable_frames: self.allocatable_frames,
             allocated_frames: self.allocated_frames,
+            recycled_frames: self.recycled_count as u64,
+            recycled_capacity: MAX_RECYCLED_FRAMES as u64,
             skipped_frames: self.skipped_frames,
             free_frames,
             next_frame: self.next_frame,
@@ -259,6 +327,10 @@ pub fn allocate_frame() -> Option<u64> {
     allocator_mut().allocate_frame()
 }
 
+pub fn free_frame(frame: u64) -> bool {
+    allocator_mut().free_frame(frame)
+}
+
 pub fn snapshot() -> Snapshot {
     allocator_mut().snapshot()
 }
@@ -277,6 +349,10 @@ fn kernel_end() -> u64 {
 
 const fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
+}
+
+const fn is_frame_aligned(value: u64) -> bool {
+    value & (FRAME_SIZE - 1) == 0
 }
 
 const fn align_up(value: u64, alignment: u64) -> u64 {

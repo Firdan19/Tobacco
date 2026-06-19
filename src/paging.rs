@@ -1,14 +1,26 @@
-use crate::serial;
+use crate::{physmem, serial};
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
+use x86_64::instructions::interrupts as cpu_interrupts;
 
 pub const PAGE_SIZE_4K: u64 = 4096;
 pub const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 pub const BOOT_IDENTITY_MAP_BYTES: u64 = 1024 * 1024 * 1024;
 pub const PAGE_TABLE_MEMORY_BYTES: u64 = PAGE_SIZE_4K * 3;
+pub const KERNEL_VIRTUAL_BASE: u64 = 0xffff_8000_0000_0000;
+pub const KERNEL_VIRTUAL_SIZE: u64 = 1024 * 1024 * 1024;
+pub const KERNEL_VIRTUAL_END: u64 = KERNEL_VIRTUAL_BASE + KERNEL_VIRTUAL_SIZE;
+pub const KERNEL_HEAP_GUARD_LOW: u64 = KERNEL_VIRTUAL_BASE + 0x0100_0000;
+pub const KERNEL_HEAP_BASE: u64 = KERNEL_HEAP_GUARD_LOW + PAGE_SIZE_4K;
+pub const KERNEL_HEAP_SIZE: u64 = 64 * 1024;
+pub const KERNEL_HEAP_GUARD_HIGH: u64 = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE;
+pub const KERNEL_VM_TEST_PAGE: u64 = KERNEL_VIRTUAL_BASE + 0x0200_0000;
 
 const PAGE_TABLE_ENTRIES: usize = 512;
 const ENTRY_PRESENT: u64 = 1 << 0;
+const ENTRY_WRITABLE: u64 = 1 << 1;
 const ENTRY_HUGE_PAGE: u64 = 1 << 7;
+const DEFAULT_PAGE_FLAGS: u64 = ENTRY_PRESENT | ENTRY_WRITABLE;
 const ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffe0_0000;
 
@@ -21,6 +33,7 @@ unsafe extern "C" {
 #[derive(Clone, Copy)]
 pub struct Snapshot {
     pub initialized: bool,
+    pub mapper_initialized: bool,
     pub cr3: u64,
     pub p4_addr: u64,
     pub p3_addr: u64,
@@ -31,6 +44,10 @@ pub struct Snapshot {
     pub huge_pages: u64,
     pub identity_mapped_bytes: u64,
     pub page_table_bytes: u64,
+    pub mapped_pages: u64,
+    pub unmapped_pages: u64,
+    pub page_table_frames: u64,
+    pub guard_pages: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -42,10 +59,63 @@ pub struct TranslateResult {
     pub page_size: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MapError {
+    VirtualUnaligned,
+    PhysicalUnaligned,
+    OutsideManagedRange,
+    PhysicalNotIdentityMapped,
+    AlreadyMapped,
+    HugePageConflict,
+    OutOfFrames,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UnmapError {
+    VirtualUnaligned,
+    OutsideManagedRange,
+    NotMapped,
+    HugePageConflict,
+    PageTableNotReachable,
+}
+
+struct MapperState {
+    initialized: bool,
+    mapped_pages: u64,
+    unmapped_pages: u64,
+    page_table_frames: u64,
+    guard_pages: u64,
+}
+
+impl MapperState {
+    const fn new() -> Self {
+        Self {
+            initialized: false,
+            mapped_pages: 0,
+            unmapped_pages: 0,
+            page_table_frames: 0,
+            guard_pages: 0,
+        }
+    }
+}
+
+struct MapperStore {
+    value: UnsafeCell<MapperState>,
+}
+
+unsafe impl Sync for MapperStore {}
+
 static PAGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static MAPPER_STATE: MapperStore = MapperStore {
+    value: UnsafeCell::new(MapperState::new()),
+};
 
 pub fn init() -> Snapshot {
     PAGING_INITIALIZED.store(true, Ordering::Release);
+    let state = mapper_state_mut();
+    state.initialized = true;
+    state.guard_pages = 2;
+
     let snapshot = snapshot();
 
     serial::log("paging", "boot page tables ready");
@@ -54,6 +124,7 @@ pub fn init() -> Snapshot {
     serial::log_hex_u64("paging", "p3 table", snapshot.p3_addr);
     serial::log_hex_u64("paging", "p2 table", snapshot.p2_addr);
     serial::log_u64("paging", "huge pages", snapshot.huge_pages);
+    serial::log("paging", "virtual mapper ready");
 
     snapshot
 }
@@ -67,9 +138,11 @@ pub fn snapshot() -> Snapshot {
     let p3_present_entries = count_present_entries(p3);
     let p2_present_entries = count_present_entries(p2);
     let huge_pages = count_huge_entries(p2);
+    let state = mapper_state();
 
     Snapshot {
         initialized: PAGING_INITIALIZED.load(Ordering::Acquire),
+        mapper_initialized: state.initialized,
         cr3: read_cr3(),
         p4_addr: p4_addr(),
         p3_addr: p3_addr(),
@@ -80,32 +153,39 @@ pub fn snapshot() -> Snapshot {
         huge_pages,
         identity_mapped_bytes: huge_pages.saturating_mul(HUGE_PAGE_SIZE),
         page_table_bytes: PAGE_TABLE_MEMORY_BYTES,
+        mapped_pages: state.mapped_pages,
+        unmapped_pages: state.unmapped_pages,
+        page_table_frames: state.page_table_frames,
+        guard_pages: state.guard_pages,
     }
 }
 
 pub fn translate(virt: u64) -> TranslateResult {
     let p4 = boot_p4();
-    let p3 = boot_p3();
-    let p2 = boot_p2();
 
     let p4_index = ((virt >> 39) & 0x1ff) as usize;
     let p3_index = ((virt >> 30) & 0x1ff) as usize;
     let p2_index = ((virt >> 21) & 0x1ff) as usize;
+    let p1_index = ((virt >> 12) & 0x1ff) as usize;
     let huge_offset = virt & (HUGE_PAGE_SIZE - 1);
 
-    if p4_index != 0 || p3_index != 0 {
+    let p4_entry = p4[p4_index];
+    if !entry_present(p4_entry) {
         return unmapped(virt);
     }
 
-    let p4_entry = p4[p4_index];
-    if !entry_present(p4_entry) || entry_addr(p4_entry) != p3_addr() {
+    let Some(p3) = table_from_entry(p4_entry) else {
         return unmapped(virt);
-    }
+    };
 
     let p3_entry = p3[p3_index];
-    if !entry_present(p3_entry) || entry_addr(p3_entry) != p2_addr() {
+    if !entry_present(p3_entry) {
         return unmapped(virt);
     }
+
+    let Some(p2) = table_from_entry(p3_entry) else {
+        return unmapped(virt);
+    };
 
     let p2_entry = p2[p2_index];
     if !entry_present(p2_entry) {
@@ -122,12 +202,112 @@ pub fn translate(virt: u64) -> TranslateResult {
         };
     }
 
+    let Some(p1) = table_from_entry(p2_entry) else {
+        return unmapped(virt);
+    };
+
+    let p1_entry = p1[p1_index];
+    if !entry_present(p1_entry) {
+        return unmapped(virt);
+    }
+
     TranslateResult {
         virt,
-        phys: entry_addr(p2_entry).saturating_add(virt & (PAGE_SIZE_4K - 1)),
+        phys: entry_addr(p1_entry).saturating_add(virt & (PAGE_SIZE_4K - 1)),
         mapped: true,
         huge_page: false,
         page_size: PAGE_SIZE_4K,
+    }
+}
+
+pub fn map_new_page(virt: u64) -> Result<u64, MapError> {
+    cpu_interrupts::without_interrupts(|| {
+        if !is_page_aligned(virt) {
+            return Err(MapError::VirtualUnaligned);
+        }
+
+        if !in_managed_virtual_range(virt) {
+            return Err(MapError::OutsideManagedRange);
+        }
+
+        if translate(virt).mapped {
+            return Err(MapError::AlreadyMapped);
+        }
+
+        let phys = physmem::allocate_frame().ok_or(MapError::OutOfFrames)?;
+        if !identity_reachable(phys) {
+            return Err(MapError::PhysicalNotIdentityMapped);
+        }
+
+        zero_frame(phys);
+        map_page_inner(virt, phys)?;
+
+        Ok(phys)
+    })
+}
+
+pub fn map_page(virt: u64, phys: u64) -> Result<(), MapError> {
+    cpu_interrupts::without_interrupts(|| map_page_inner(virt, phys))
+}
+
+pub fn unmap_page(virt: u64) -> Result<u64, UnmapError> {
+    cpu_interrupts::without_interrupts(|| unmap_page_inner(virt))
+}
+
+pub fn probe_map_unmap(virt: u64) -> bool {
+    if translate(virt).mapped {
+        return false;
+    }
+
+    let Ok(phys) = map_new_page(virt) else {
+        return false;
+    };
+
+    let mapped = translate(virt);
+    if !mapped.mapped || mapped.phys != phys || mapped.page_size != PAGE_SIZE_4K {
+        return false;
+    }
+
+    let Ok(unmapped_phys) = unmap_page(virt) else {
+        return false;
+    };
+
+    unmapped_phys == phys && physmem::free_frame(unmapped_phys) && !translate(virt).mapped
+}
+
+pub fn fault_policy(address: u64, _error_code: u64) -> &'static str {
+    if in_page(address, KERNEL_HEAP_GUARD_LOW) || in_page(address, KERNEL_HEAP_GUARD_HIGH) {
+        "heap guard page violation"
+    } else if in_managed_virtual_range(address) && !translate(address).mapped {
+        "managed virtual address not mapped"
+    } else if in_managed_virtual_range(address) {
+        "managed virtual address protection fault"
+    } else if address < BOOT_IDENTITY_MAP_BYTES {
+        "low identity-map page fault"
+    } else {
+        "outside Tobacco managed virtual memory"
+    }
+}
+
+pub fn map_error_name(error: MapError) -> &'static str {
+    match error {
+        MapError::VirtualUnaligned => "virtual address is not 4 KiB aligned",
+        MapError::PhysicalUnaligned => "physical address is not 4 KiB aligned",
+        MapError::OutsideManagedRange => "virtual address outside managed range",
+        MapError::PhysicalNotIdentityMapped => "physical frame is not identity reachable",
+        MapError::AlreadyMapped => "virtual page is already mapped",
+        MapError::HugePageConflict => "mapping conflicts with a huge page",
+        MapError::OutOfFrames => "physical frame allocator exhausted",
+    }
+}
+
+pub fn unmap_error_name(error: UnmapError) -> &'static str {
+    match error {
+        UnmapError::VirtualUnaligned => "virtual address is not 4 KiB aligned",
+        UnmapError::OutsideManagedRange => "virtual address outside managed range",
+        UnmapError::NotMapped => "virtual page is not mapped",
+        UnmapError::HugePageConflict => "mapping conflicts with a huge page",
+        UnmapError::PageTableNotReachable => "page table is not identity reachable",
     }
 }
 
@@ -143,6 +323,10 @@ fn unmapped(virt: u64) -> TranslateResult {
 
 fn boot_p4() -> &'static [u64; PAGE_TABLE_ENTRIES] {
     unsafe { &*(p4_addr() as *const [u64; PAGE_TABLE_ENTRIES]) }
+}
+
+fn boot_p4_mut() -> &'static mut [u64; PAGE_TABLE_ENTRIES] {
+    unsafe { &mut *(p4_addr() as *mut [u64; PAGE_TABLE_ENTRIES]) }
 }
 
 fn boot_p3() -> &'static [u64; PAGE_TABLE_ENTRIES] {
@@ -189,6 +373,161 @@ fn count_huge_entries(table: &[u64; PAGE_TABLE_ENTRIES]) -> u64 {
     count
 }
 
+fn map_page_inner(virt: u64, phys: u64) -> Result<(), MapError> {
+    if !is_page_aligned(virt) {
+        return Err(MapError::VirtualUnaligned);
+    }
+
+    if !is_page_aligned(phys) {
+        return Err(MapError::PhysicalUnaligned);
+    }
+
+    if !in_managed_virtual_range(virt) {
+        return Err(MapError::OutsideManagedRange);
+    }
+
+    if !identity_reachable(phys) {
+        return Err(MapError::PhysicalNotIdentityMapped);
+    }
+
+    let p4_index = ((virt >> 39) & 0x1ff) as usize;
+    let p3_index = ((virt >> 30) & 0x1ff) as usize;
+    let p2_index = ((virt >> 21) & 0x1ff) as usize;
+    let p1_index = ((virt >> 12) & 0x1ff) as usize;
+
+    let p4 = boot_p4_mut();
+    let p3 = ensure_next_table(&mut p4[p4_index])?;
+    let p2 = ensure_next_table(&mut p3[p3_index])?;
+
+    if entry_huge(p2[p2_index]) {
+        return Err(MapError::HugePageConflict);
+    }
+
+    let p1 = ensure_next_table(&mut p2[p2_index])?;
+
+    if entry_present(p1[p1_index]) {
+        return Err(MapError::AlreadyMapped);
+    }
+
+    p1[p1_index] = phys | DEFAULT_PAGE_FLAGS;
+    let state = mapper_state_mut();
+    state.mapped_pages = state.mapped_pages.saturating_add(1);
+    invlpg(virt);
+
+    Ok(())
+}
+
+fn unmap_page_inner(virt: u64) -> Result<u64, UnmapError> {
+    if !is_page_aligned(virt) {
+        return Err(UnmapError::VirtualUnaligned);
+    }
+
+    if !in_managed_virtual_range(virt) {
+        return Err(UnmapError::OutsideManagedRange);
+    }
+
+    let p4_index = ((virt >> 39) & 0x1ff) as usize;
+    let p3_index = ((virt >> 30) & 0x1ff) as usize;
+    let p2_index = ((virt >> 21) & 0x1ff) as usize;
+    let p1_index = ((virt >> 12) & 0x1ff) as usize;
+
+    let p4 = boot_p4_mut();
+    if !entry_present(p4[p4_index]) {
+        return Err(UnmapError::NotMapped);
+    }
+
+    let p3 = table_from_entry_mut(p4[p4_index]).ok_or(UnmapError::PageTableNotReachable)?;
+    if !entry_present(p3[p3_index]) {
+        return Err(UnmapError::NotMapped);
+    }
+
+    let p2 = table_from_entry_mut(p3[p3_index]).ok_or(UnmapError::PageTableNotReachable)?;
+    if entry_huge(p2[p2_index]) {
+        return Err(UnmapError::HugePageConflict);
+    }
+
+    if !entry_present(p2[p2_index]) {
+        return Err(UnmapError::NotMapped);
+    }
+
+    let p1 = table_from_entry_mut(p2[p2_index]).ok_or(UnmapError::PageTableNotReachable)?;
+    let entry = p1[p1_index];
+    if !entry_present(entry) {
+        return Err(UnmapError::NotMapped);
+    }
+
+    p1[p1_index] = 0;
+    let state = mapper_state_mut();
+    state.unmapped_pages = state.unmapped_pages.saturating_add(1);
+    invlpg(virt);
+
+    Ok(entry_addr(entry))
+}
+
+fn ensure_next_table(entry: &mut u64) -> Result<&'static mut [u64; PAGE_TABLE_ENTRIES], MapError> {
+    if entry_present(*entry) {
+        if entry_huge(*entry) {
+            return Err(MapError::HugePageConflict);
+        }
+
+        return table_from_entry_mut(*entry).ok_or(MapError::PhysicalNotIdentityMapped);
+    }
+
+    let frame = physmem::allocate_frame().ok_or(MapError::OutOfFrames)?;
+    if !identity_reachable(frame) {
+        return Err(MapError::PhysicalNotIdentityMapped);
+    }
+
+    zero_frame(frame);
+    *entry = frame | DEFAULT_PAGE_FLAGS;
+    let state = mapper_state_mut();
+    state.page_table_frames = state.page_table_frames.saturating_add(1);
+
+    table_from_entry_mut(*entry).ok_or(MapError::PhysicalNotIdentityMapped)
+}
+
+fn table_from_entry(entry: u64) -> Option<&'static [u64; PAGE_TABLE_ENTRIES]> {
+    let address = entry_addr(entry);
+
+    if !identity_reachable(address) {
+        return None;
+    }
+
+    Some(unsafe { &*(address as *const [u64; PAGE_TABLE_ENTRIES]) })
+}
+
+fn table_from_entry_mut(entry: u64) -> Option<&'static mut [u64; PAGE_TABLE_ENTRIES]> {
+    let address = entry_addr(entry);
+
+    if !identity_reachable(address) {
+        return None;
+    }
+
+    Some(unsafe { &mut *(address as *mut [u64; PAGE_TABLE_ENTRIES]) })
+}
+
+fn zero_frame(phys: u64) {
+    unsafe {
+        core::ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE_4K as usize);
+    }
+}
+
+fn in_managed_virtual_range(virt: u64) -> bool {
+    virt >= KERNEL_VIRTUAL_BASE && virt < KERNEL_VIRTUAL_END
+}
+
+fn identity_reachable(phys: u64) -> bool {
+    phys < BOOT_IDENTITY_MAP_BYTES
+}
+
+fn is_page_aligned(value: u64) -> bool {
+    value & (PAGE_SIZE_4K - 1) == 0
+}
+
+fn in_page(address: u64, page_start: u64) -> bool {
+    address >= page_start && address < page_start.saturating_add(PAGE_SIZE_4K)
+}
+
 fn entry_present(entry: u64) -> bool {
     entry & ENTRY_PRESENT != 0
 }
@@ -203,6 +542,24 @@ fn entry_addr(entry: u64) -> u64 {
 
 fn huge_entry_addr(entry: u64) -> u64 {
     entry & HUGE_ENTRY_ADDR_MASK
+}
+
+fn mapper_state() -> &'static MapperState {
+    unsafe { &*MAPPER_STATE.value.get() }
+}
+
+fn mapper_state_mut() -> &'static mut MapperState {
+    unsafe { &mut *MAPPER_STATE.value.get() }
+}
+
+fn invlpg(virt: u64) {
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{address}]",
+            address = in(reg) virt,
+            options(nostack, preserves_flags)
+        );
+    }
 }
 
 fn read_cr3() -> u64 {

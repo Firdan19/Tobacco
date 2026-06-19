@@ -7,6 +7,7 @@ use x86_64::instructions::interrupts as cpu_interrupts;
 
 mod ci;
 mod gdt;
+mod heap;
 mod interrupts;
 mod keyboard;
 mod klog;
@@ -170,6 +171,8 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
         "identity mapped bytes",
         paging_state.identity_mapped_bytes,
     );
+    let heap_state = heap::init();
+    serial::log_u64("heap", "heap bytes", heap_state.size);
 
     vga::init();
     vga::show_splash();

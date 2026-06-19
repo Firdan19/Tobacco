@@ -1,4 +1,6 @@
-use crate::{gdt, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats};
+use crate::{
+    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats,
+};
 
 const CI_BOOT_FLAG: &[u8] = b"tobacco.ci=smoke";
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
@@ -35,6 +37,8 @@ fn run_command_table_checks() {
     check("command selftest", shell::command_exists(b"selftest"));
     check("command stress", shell::command_exists(b"stress"));
     check("command paging", shell::command_exists(b"paging"));
+    check("command heap", shell::command_exists(b"heap"));
+    check("command vmtest", shell::command_exists(b"vmtest"));
     check("command mem", shell::command_exists(b"mem"));
     check("command log", shell::command_exists(b"log"));
 }
@@ -47,6 +51,7 @@ fn run_selftest_checks() -> bool {
     let vga_translation = paging::translate(VGA_BUFFER_ADDRESS);
     let high_translation = paging::translate(0xffff_8000_0000_0000);
     let gdt = gdt::snapshot();
+    let heap_snapshot = heap::snapshot();
     let log = klog::snapshot();
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
@@ -72,7 +77,7 @@ fn run_selftest_checks() -> bool {
     );
     ok &= check(
         "selftest paging initialized",
-        paging_state.initialized && paging_state.cr3 != 0,
+        paging_state.initialized && paging_state.mapper_initialized && paging_state.cr3 != 0,
     );
     ok &= check(
         "selftest boot identity map",
@@ -89,6 +94,19 @@ fn run_selftest_checks() -> bool {
             && vga_translation.huge_page,
     );
     ok &= check("selftest high address unmapped", !high_translation.mapped);
+    ok &= check(
+        "selftest virtual map unmap",
+        paging::probe_map_unmap(paging::KERNEL_VM_TEST_PAGE),
+    );
+    ok &= check(
+        "selftest heap ready",
+        heap_snapshot.initialized
+            && heap_snapshot.mapped_pages == heap::HEAP_PAGES
+            && heap_snapshot.remaining <= heap_snapshot.size
+            && !paging::translate(heap_snapshot.guard_low).mapped
+            && !paging::translate(heap_snapshot.guard_high).mapped,
+    );
+    ok &= check("selftest heap probe", heap::probe());
     ok &= check(
         "selftest gdt tss ist ready",
         gdt.loaded
@@ -111,7 +129,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 24);
+    ok &= check("selftest command table sane", shell::command_count() >= 26);
 
     ok
 }
