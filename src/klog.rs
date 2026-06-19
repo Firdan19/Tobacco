@@ -68,7 +68,10 @@ impl LogRing {
     }
 
     fn init(&mut self) {
-        *self = Self::new();
+        self.write_index = 0;
+        self.count = 0;
+        self.dropped = 0;
+        self.next_sequence = 0;
         self.initialized = true;
     }
 
