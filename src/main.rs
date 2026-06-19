@@ -5,6 +5,7 @@ use core::panic::PanicInfo;
 use x86_64::instructions::hlt;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
+mod ci;
 mod gdt;
 mod interrupts;
 mod keyboard;
@@ -178,6 +179,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     serial::log("keyboard", "ps/2 controller drained");
     interrupts::init();
     stats::mark_shell_ready(interrupts::ticks());
+    ci::run_if_requested();
 
     shell::run();
 }

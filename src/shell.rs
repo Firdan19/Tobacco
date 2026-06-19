@@ -139,6 +139,20 @@ const COMMANDS: [Command; 24] = [
     },
 ];
 
+pub fn command_count() -> usize {
+    COMMANDS.len()
+}
+
+pub fn command_exists(name: &[u8]) -> bool {
+    for command in COMMANDS.iter() {
+        if eq_ignore_ascii_case(name, command.name.as_bytes()) {
+            return true;
+        }
+    }
+
+    false
+}
+
 struct CommandHistory {
     entries: [[u8; INPUT_BUFFER_SIZE]; HISTORY_SIZE],
     lengths: [usize; HISTORY_SIZE],
