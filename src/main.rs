@@ -8,6 +8,7 @@ use x86_64::instructions::interrupts as cpu_interrupts;
 mod interrupts;
 mod keyboard;
 mod multiboot;
+mod physmem;
 mod serial;
 mod shell;
 mod stats;
@@ -142,6 +143,8 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
         "memory regions",
         boot_info.memory.region_count as u64,
     );
+    let frame_allocator = physmem::init();
+    serial::log_u64("mem", "free frames", frame_allocator.free_frames);
 
     vga::init();
     vga::show_splash();

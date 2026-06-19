@@ -1,11 +1,10 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{interrupts, multiboot, serial, stats, vga};
+use crate::{interrupts, multiboot, physmem, serial, stats, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
 const HISTORY_SIZE: usize = 16;
 const PIT_HZ: u64 = 18;
-const KERNEL_LOAD_BASE: u64 = 0x0010_0000;
 const IDENTITY_MAP_BYTES: u64 = 1024 * 1024 * 1024;
 const PAGE_TABLE_BYTES: u64 = 4096 * 3;
 const STACK_BYTES: u64 = 16 * 1024;
@@ -17,7 +16,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 15] = [
+const COMMANDS: [Command; 17] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -62,6 +61,16 @@ const COMMANDS: [Command; 15] = [
         name: "memmap",
         description: "daftar region memory map",
         handler: command_memmap,
+    },
+    Command {
+        name: "frames",
+        description: "status physical frame allocator",
+        handler: command_frames,
+    },
+    Command {
+        name: "frame",
+        description: "alokasi satu frame uji",
+        handler: command_frame,
     },
     Command {
         name: "ticks",
@@ -416,6 +425,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  irq       : IDT 256, PIC 8259 remap, PIT timer");
     println("  keyboard  : PS/2 IRQ1 event layer");
     println("  boot info : Multiboot2 parser + memory map");
+    println("  memory    : physical frame allocator");
     println("  shell     : line editor, history, command table");
     println("  metrics   : perf, irq, boot, bench");
 }
@@ -423,10 +433,14 @@ fn command_sysinfo(_arguments: &[u8]) {
 fn command_mem(_arguments: &[u8]) {
     let boot_info = multiboot::summary();
     let memory = boot_info.memory;
+    let frames = physmem::snapshot();
 
     println("Tobacco memory info:");
-    print("  kernel base       : ");
-    print_hex_u64(KERNEL_LOAD_BASE);
+    print("  kernel start      : ");
+    print_hex_u64(frames.kernel_start);
+    newline();
+    print("  kernel end        : ");
+    print_hex_u64(frames.kernel_end);
     newline();
     print("  identity map      : ");
     print_u64(IDENTITY_MAP_BYTES / 1024 / 1024);
@@ -491,8 +505,21 @@ fn command_mem(_arguments: &[u8]) {
     print("  vga buffer        : ");
     print_hex_u64(VGA_BUFFER_ADDRESS);
     newline();
-    println("  allocator         : none");
-    println("  next              : frame allocator");
+    print("  allocator         : ");
+    print_on_off(frames.initialized);
+    newline();
+    print("  protected until   : ");
+    print_hex_u64(frames.protected_until);
+    newline();
+    print("  allocatable       : ");
+    print_u64(frames.allocatable_frames);
+    println(" frame(s)");
+    print("  allocated         : ");
+    print_u64(frames.allocated_frames);
+    println(" frame(s)");
+    print("  free              : ");
+    print_u64(frames.free_frames);
+    println(" frame(s)");
 }
 
 fn command_memmap(_arguments: &[u8]) {
@@ -525,6 +552,55 @@ fn command_memmap(_arguments: &[u8]) {
         print(" of ");
         print_u64(memory.region_count as u64);
         println(" region(s)");
+    }
+}
+
+fn command_frames(_arguments: &[u8]) {
+    let frames = physmem::snapshot();
+
+    println("Frame allocator:");
+    print("  initialized       : ");
+    print_on_off(frames.initialized);
+    newline();
+    print("  exhausted         : ");
+    print_on_off(frames.exhausted);
+    newline();
+    print_counter("regions", frames.region_count as u64);
+    print_counter("current region", frames.current_region as u64);
+    print_counter("total usable", frames.total_usable_frames);
+    print_counter("allocatable", frames.allocatable_frames);
+    print_counter("allocated", frames.allocated_frames);
+    print_counter("free", frames.free_frames);
+    print_counter("skipped", frames.skipped_frames);
+    print("  next frame        : ");
+    print_hex_u64(frames.next_frame);
+    newline();
+    print("  last allocated    : ");
+    print_hex_u64(frames.last_allocated_frame);
+    newline();
+    print("  kernel start      : ");
+    print_hex_u64(frames.kernel_start);
+    newline();
+    print("  kernel end        : ");
+    print_hex_u64(frames.kernel_end);
+    newline();
+    print("  protected until   : ");
+    print_hex_u64(frames.protected_until);
+    newline();
+}
+
+fn command_frame(_arguments: &[u8]) {
+    match physmem::allocate_frame() {
+        Some(frame) => {
+            serial::log_u64("mem", "allocated frame", frame);
+            print("allocated frame: ");
+            print_hex_u64(frame);
+            newline();
+        }
+        None => {
+            serial::log("mem", "frame allocator exhausted");
+            println("Frame allocator habis.");
+        }
     }
 }
 
@@ -586,6 +662,7 @@ fn command_irq(_arguments: &[u8]) {
 fn command_boot(_arguments: &[u8]) {
     let snapshot = stats::snapshot();
     let boot_info = multiboot::summary();
+    let frames = physmem::snapshot();
 
     println("Boot status:");
     println("  name          : Tobacco");
@@ -614,6 +691,10 @@ fn command_boot(_arguments: &[u8]) {
         print("  command line  : ");
         println(boot_info.command_line.as_str());
     }
+    print("  frame alloc   : ");
+    print_on_off(frames.initialized);
+    newline();
+    print_counter("free frames", frames.free_frames);
     print_counter("shell ready tick", snapshot.shell_ready_tick);
     print_counter("current ticks", interrupts::ticks());
 }

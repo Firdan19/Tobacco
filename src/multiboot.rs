@@ -86,6 +86,10 @@ impl MemoryRegion {
             _ => "reserved",
         }
     }
+
+    pub fn is_available(&self) -> bool {
+        self.region_type == MEMORY_AVAILABLE
+    }
 }
 
 #[derive(Clone, Copy)]
