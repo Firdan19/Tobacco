@@ -60,6 +60,11 @@ const COMMANDS: [Command; 32] = [
         handler: command_health,
     },
     Command {
+        name: "status",
+        description: "alias cepat untuk health",
+        handler: command_health,
+    },
+    Command {
         name: "diag",
         description: "diagnostik observability lengkap",
         handler: command_diag,

@@ -84,6 +84,7 @@ fn run_command_table_checks() {
     serial::log_u64("ci", "command table count", shell::command_count() as u64);
     check("command help", shell::command_exists(b"help"));
     check("command health", shell::command_exists(b"health"));
+    check("command status", shell::command_exists(b"status"));
     check("command diag", shell::command_exists(b"diag"));
     check("command lastpanic", shell::command_exists(b"lastpanic"));
     check("command buildinfo", shell::command_exists(b"buildinfo"));
