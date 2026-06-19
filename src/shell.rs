@@ -16,7 +16,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 26] = [
+const COMMANDS: [Command; 27] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -81,6 +81,11 @@ const COMMANDS: [Command; 26] = [
         name: "keyboard",
         description: "status input keyboard PS/2",
         handler: command_keyboard,
+    },
+    Command {
+        name: "consoletest",
+        description: "uji editor, history, dan command lookup",
+        handler: command_consoletest,
     },
     Command {
         name: "perf",
@@ -161,6 +166,28 @@ pub fn command_exists(name: &[u8]) -> bool {
     }
 
     false
+}
+
+pub struct ConsoleModelReport {
+    pub long_input: bool,
+    pub backspace_long: bool,
+    pub line_editing: bool,
+    pub history_navigation: bool,
+    pub command_lookup: bool,
+}
+
+pub fn run_console_model_checks() -> ConsoleModelReport {
+    ConsoleModelReport {
+        long_input: check_long_input_capacity(),
+        backspace_long: check_long_backspace(),
+        line_editing: check_line_editing(),
+        history_navigation: check_history_navigation(),
+        command_lookup: check_command_lookup(),
+    }
+}
+
+pub fn execute_for_ci(input: &[u8]) {
+    execute(input);
 }
 
 struct CommandHistory {
@@ -402,6 +429,142 @@ fn delete_previous_input_byte(
 
     *cursor -= 1;
     *input_len -= 1;
+
+    true
+}
+
+fn check_long_input_capacity() -> bool {
+    let mut input = [0u8; INPUT_BUFFER_SIZE];
+    let mut input_len = 0usize;
+    let mut cursor = 0usize;
+    let mut inserted = 0usize;
+
+    for index in 0..(INPUT_BUFFER_SIZE + 16) {
+        if insert_input_byte(
+            &mut input,
+            &mut input_len,
+            &mut cursor,
+            b'a' + (index % 26) as u8,
+        ) {
+            inserted += 1;
+        }
+    }
+
+    inserted == INPUT_BUFFER_SIZE
+        && input_len == INPUT_BUFFER_SIZE
+        && cursor == INPUT_BUFFER_SIZE
+        && !insert_input_byte(&mut input, &mut input_len, &mut cursor, b'!')
+}
+
+fn check_long_backspace() -> bool {
+    let mut input = [0u8; INPUT_BUFFER_SIZE];
+    let mut input_len = 0usize;
+    let mut cursor = 0usize;
+
+    for _ in 0..INPUT_BUFFER_SIZE {
+        if !insert_input_byte(&mut input, &mut input_len, &mut cursor, b'x') {
+            return false;
+        }
+    }
+
+    let mut deleted = 0usize;
+    while delete_previous_input_byte(&mut input, &mut input_len, &mut cursor) {
+        deleted += 1;
+    }
+
+    deleted == INPUT_BUFFER_SIZE && input_len == 0 && cursor == 0
+}
+
+fn check_line_editing() -> bool {
+    let mut input = [0u8; INPUT_BUFFER_SIZE];
+    let mut input_len = 0usize;
+    let mut cursor = 0usize;
+
+    for byte in b"helo".iter().copied() {
+        if !insert_input_byte(&mut input, &mut input_len, &mut cursor, byte) {
+            return false;
+        }
+    }
+
+    cursor = 3;
+    if !insert_input_byte(&mut input, &mut input_len, &mut cursor, b'l') {
+        return false;
+    }
+
+    cursor = 1;
+    if !insert_input_byte(&mut input, &mut input_len, &mut cursor, b'E') {
+        return false;
+    }
+
+    if !delete_previous_input_byte(&mut input, &mut input_len, &mut cursor) {
+        return false;
+    }
+
+    input_len == 5 && cursor == 1 && bytes_eq(&input[..input_len], b"hello")
+}
+
+fn check_history_navigation() -> bool {
+    let mut history = CommandHistory::new();
+    let mut input = [0u8; INPUT_BUFFER_SIZE];
+    let mut input_len = 0usize;
+    let mut cursor = 0usize;
+
+    history.push(b"help");
+    history.push(b"version");
+    history.push(b"about");
+    history.push(b"about");
+
+    if history.len != 3 {
+        return false;
+    }
+
+    let Some(latest) = history.previous_index(None) else {
+        return false;
+    };
+
+    if !history.load(latest, &mut input, &mut input_len, &mut cursor)
+        || !bytes_eq(&input[..input_len], b"about")
+        || cursor != input_len
+    {
+        return false;
+    }
+
+    let Some(previous) = history.previous_index(Some(latest)) else {
+        return false;
+    };
+
+    if !history.load(previous, &mut input, &mut input_len, &mut cursor)
+        || !bytes_eq(&input[..input_len], b"version")
+    {
+        return false;
+    }
+
+    let Some(next) = history.next_index(Some(previous)) else {
+        return false;
+    };
+
+    history.load(next, &mut input, &mut input_len, &mut cursor)
+        && bytes_eq(&input[..input_len], b"about")
+        && history.next_index(Some(next)).is_none()
+}
+
+fn check_command_lookup() -> bool {
+    command_exists(b"HELP")
+        && command_exists(b"HeLp")
+        && command_exists(b"stress")
+        && !command_exists(b"definitely-not-a-command")
+}
+
+fn bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    for index in 0..left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+    }
 
     true
 }
@@ -704,6 +867,51 @@ fn command_keyboard(_arguments: &[u8]) {
     print("  queued     : ");
     print_u64(keyboard::pending_events() as u64);
     println(" event(s)");
+}
+
+fn command_consoletest(_arguments: &[u8]) {
+    let report = run_console_model_checks();
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+
+    serial::log("console", "manual test started");
+    println("Console model test:");
+    selftest_check("long input", report.long_input, &mut passed, &mut failed);
+    selftest_check(
+        "long backspace",
+        report.backspace_long,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "line editing",
+        report.line_editing,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "history navigation",
+        report.history_navigation,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "command lookup",
+        report.command_lookup,
+        &mut passed,
+        &mut failed,
+    );
+    print_counter("passed", passed);
+    print_counter("failed", failed);
+
+    if failed == 0 {
+        serial::log("console", "manual test passed");
+        println("status: PASS");
+    } else {
+        serial::log("console", "manual test failed");
+        stats::inc_shell_error();
+        println("status: FAIL");
+    }
 }
 
 fn command_perf(_arguments: &[u8]) {
@@ -1139,7 +1347,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 26,
+        COMMANDS.len() >= 27,
         &mut passed,
         &mut failed,
     );

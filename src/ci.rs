@@ -1,5 +1,5 @@
 use crate::{
-    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats,
+    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats, vga,
 };
 
 const CI_BOOT_FLAG: &[u8] = b"tobacco.ci=smoke";
@@ -28,6 +28,12 @@ pub fn run_if_requested() {
         serial::log("ci", "stress status: FAIL");
     }
 
+    if run_console_stress_checks() {
+        serial::log("ci", "console status: PASS");
+    } else {
+        serial::log("ci", "console status: FAIL");
+    }
+
     serial::log("ci", "command smoke complete");
 }
 
@@ -39,6 +45,7 @@ fn run_command_table_checks() {
     check("command paging", shell::command_exists(b"paging"));
     check("command heap", shell::command_exists(b"heap"));
     check("command vmtest", shell::command_exists(b"vmtest"));
+    check("command consoletest", shell::command_exists(b"consoletest"));
     check("command mem", shell::command_exists(b"mem"));
     check("command log", shell::command_exists(b"log"));
 }
@@ -129,7 +136,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 26);
+    ok &= check("selftest command table sane", shell::command_count() >= 27);
 
     ok
 }
@@ -176,6 +183,64 @@ fn run_stability_stress() -> bool {
     ok &= check("stress serial monotonic", serial_after >= serial_before);
     ok &= check("stress checksum stable", checksum != 0);
     serial::log_hex_u64("ci", "stress checksum", checksum);
+
+    ok
+}
+
+fn run_console_stress_checks() -> bool {
+    let report = shell::run_console_model_checks();
+    let mut ok = true;
+
+    ok &= check("console long input", report.long_input);
+    ok &= check("console long backspace", report.backspace_long);
+    ok &= check("console line editing", report.line_editing);
+    ok &= check("console history navigation", report.history_navigation);
+    ok &= check("console command lookup", report.command_lookup);
+
+    let stats_before_invalid = stats::snapshot();
+    for index in 0..24u64 {
+        serial::log_u64("ci", "invalid burst index", index);
+        shell::execute_for_ci(b"definitely-not-a-command");
+    }
+    let stats_after_invalid = stats::snapshot();
+    ok &= check(
+        "console invalid command burst",
+        stats_after_invalid.shell_errors >= stats_before_invalid.shell_errors.saturating_add(24),
+    );
+
+    let log_before = klog::snapshot();
+    for index in 0..(klog::ENTRY_COUNT * 3) {
+        klog::append_u64("ci-console", "log flood", index as u64);
+    }
+    let log_after = klog::snapshot();
+    ok &= check(
+        "console log flood bounded",
+        log_after.count <= log_after.capacity
+            && log_after.next_sequence > log_before.next_sequence
+            && log_after.dropped >= log_before.dropped,
+    );
+
+    let stats_before_scroll = stats::snapshot();
+    for _ in 0..32 {
+        vga::write_line("console scroll stress line");
+    }
+    let stats_after_scroll = stats::snapshot();
+    ok &= check(
+        "console scroll region",
+        stats_after_scroll.vga_scrolls > stats_before_scroll.vga_scrolls,
+    );
+
+    let mut long_input = [b'z'; 180];
+    for index in 0..long_input.len() {
+        long_input[index] = b'a' + (index % 26) as u8;
+    }
+    let stats_before_render = stats::snapshot();
+    vga::render_input_with_cursor(&long_input, 91);
+    let stats_after_render = stats::snapshot();
+    ok &= check(
+        "console render wrapped input",
+        stats_after_render.vga_cell_writes > stats_before_render.vga_cell_writes,
+    );
 
     ok
 }
