@@ -48,6 +48,7 @@ assert_log() {
 }
 
 assert_log "[boot] Tobacco v0.0.5 booting..."
+assert_log "[klog] ring buffer ready"
 assert_log "[gdt] gdt, tss, ist ready"
 assert_log "[gdt] tss base:"
 assert_log "[gdt] double fault ist top:"

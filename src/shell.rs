@@ -1,5 +1,5 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{gdt, interrupts, multiboot, paging, physmem, serial, stats, vga};
+use crate::{gdt, interrupts, klog, multiboot, paging, physmem, serial, stats, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -14,7 +14,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 20] = [
+const COMMANDS: [Command; 22] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -109,6 +109,16 @@ const COMMANDS: [Command; 20] = [
         name: "virt",
         description: "translate virtual address",
         handler: command_virt,
+    },
+    Command {
+        name: "log",
+        description: "tampilkan kernel ring log",
+        handler: command_log,
+    },
+    Command {
+        name: "dmesg",
+        description: "alias untuk kernel ring log",
+        handler: command_log,
     },
     Command {
         name: "bench",
@@ -443,6 +453,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  gdt/tss   : double fault IST stack");
     println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
+    println("  klog      : in-memory kernel ring buffer");
     println("  metrics   : perf, irq, boot, bench");
 }
 
@@ -681,6 +692,7 @@ fn command_boot(_arguments: &[u8]) {
     let frames = physmem::snapshot();
     let gdt = gdt::snapshot();
     let paging = paging::snapshot();
+    let log = klog::snapshot();
 
     println("Boot status:");
     println("  name          : Tobacco");
@@ -720,6 +732,10 @@ fn command_boot(_arguments: &[u8]) {
     print("  paging        : ");
     print_on_off(paging.initialized);
     newline();
+    print("  kernel log    : ");
+    print_on_off(log.initialized);
+    newline();
+    print_counter("log entries", log.count);
     print_counter("free frames", frames.free_frames);
     print_counter("shell ready tick", snapshot.shell_ready_tick);
     print_counter("current ticks", interrupts::ticks());
@@ -828,6 +844,37 @@ fn command_virt(arguments: &[u8]) {
     }
 }
 
+fn command_log(arguments: &[u8]) {
+    let snapshot = klog::snapshot();
+    let limit = log_limit(arguments, snapshot.count as usize);
+    let start = (snapshot.count as usize).saturating_sub(limit);
+
+    println("Kernel log ring:");
+    print_counter("capacity", snapshot.capacity);
+    print_counter("entries", snapshot.count);
+    print_counter("dropped", snapshot.dropped);
+    print_counter("next sequence", snapshot.next_sequence);
+
+    if snapshot.count == 0 {
+        println("  belum ada entry log.");
+        return;
+    }
+
+    for index in start..(snapshot.count as usize) {
+        if let Some(entry) = klog::entry(index) {
+            print("  #");
+            print_u64(entry.sequence);
+            print(" t+");
+            print_u64(entry.tick);
+            print(" [");
+            print_log_bytes(entry.tag());
+            print("] ");
+            print_log_bytes(entry.message());
+            newline();
+        }
+    }
+}
+
 fn command_bench(_arguments: &[u8]) {
     stats::inc_bench_run();
 
@@ -912,6 +959,13 @@ fn print_ascii_line(bytes: &[u8]) {
     }
 
     newline();
+}
+
+fn print_log_bytes(bytes: &[u8]) {
+    for byte in bytes.iter().copied() {
+        vga::write_byte(byte);
+        serial::write_byte(byte);
+    }
 }
 
 fn newline() {
@@ -1036,6 +1090,26 @@ fn parse_u64(input: &[u8]) -> Option<u64> {
         Some(value)
     } else {
         None
+    }
+}
+
+fn log_limit(arguments: &[u8], total: usize) -> usize {
+    let arguments = trim_ascii(arguments);
+
+    if arguments.is_empty() {
+        return total.min(16);
+    }
+
+    if eq_ignore_ascii_case(arguments, b"all") {
+        return total;
+    }
+
+    match parse_u64(arguments) {
+        Some(value) => (value as usize).min(total),
+        None => {
+            stats::inc_shell_error();
+            16usize.min(total)
+        }
     }
 }
 

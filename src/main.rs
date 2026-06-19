@@ -8,6 +8,7 @@ use x86_64::instructions::interrupts as cpu_interrupts;
 mod gdt;
 mod interrupts;
 mod keyboard;
+mod klog;
 mod multiboot;
 mod paging;
 mod physmem;
@@ -137,6 +138,8 @@ stack_top:
 #[no_mangle]
 pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) -> ! {
     serial::init();
+    klog::init();
+    serial::log("klog", "ring buffer ready");
     serial::log("boot", "Tobacco v0.0.5 booting...");
     let gdt_state = gdt::init();
     serial::log("gdt", "gdt, tss, ist ready");

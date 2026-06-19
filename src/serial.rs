@@ -1,4 +1,4 @@
-use crate::stats;
+use crate::{klog, stats};
 use x86_64::instructions::interrupts as cpu_interrupts;
 use x86_64::instructions::port::Port;
 
@@ -40,6 +40,7 @@ pub fn serial_println(s: &str) {
 }
 
 pub fn log(tag: &str, message: &str) {
+    klog::append(tag, message);
     serial_print("[");
     serial_print(tag);
     serial_print("] ");
@@ -47,6 +48,7 @@ pub fn log(tag: &str, message: &str) {
 }
 
 pub fn log_bytes(tag: &str, label: &str, bytes: &[u8]) {
+    klog::append_labeled_bytes(tag, label, bytes);
     serial_print("[");
     serial_print(tag);
     serial_print("] ");
@@ -57,6 +59,7 @@ pub fn log_bytes(tag: &str, label: &str, bytes: &[u8]) {
 }
 
 pub fn log_u64(tag: &str, label: &str, value: u64) {
+    klog::append_u64(tag, label, value);
     serial_print("[");
     serial_print(tag);
     serial_print("] ");
@@ -67,6 +70,7 @@ pub fn log_u64(tag: &str, label: &str, value: u64) {
 }
 
 pub fn log_hex_u64(tag: &str, label: &str, value: u64) {
+    klog::append_hex_u64(tag, label, value);
     serial_print("[");
     serial_print(tag);
     serial_print("] ");
@@ -77,6 +81,7 @@ pub fn log_hex_u64(tag: &str, label: &str, value: u64) {
 }
 
 pub fn log_bool(tag: &str, label: &str, enabled: bool) {
+    klog::append_bool(tag, label, enabled);
     serial_print("[");
     serial_print(tag);
     serial_print("] ");
