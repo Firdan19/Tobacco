@@ -7,6 +7,8 @@ const HISTORY_SIZE: usize = 16;
 const PIT_HZ: u64 = 18;
 const STACK_BYTES: u64 = 16 * 1024;
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
+const STRESS_DEFAULT_CYCLES: usize = 4;
+const STRESS_MAX_CYCLES: usize = 32;
 
 struct Command {
     name: &'static str,
@@ -14,7 +16,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 23] = [
+const COMMANDS: [Command; 24] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -124,6 +126,11 @@ const COMMANDS: [Command; 23] = [
         name: "selftest",
         description: "uji mandiri subsistem Phase 1",
         handler: command_selftest,
+    },
+    Command {
+        name: "stress",
+        description: "uji stabilitas ringan kernel",
+        handler: command_stress,
     },
     Command {
         name: "bench",
@@ -460,6 +467,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  shell     : line editor, history, command table");
     println("  klog      : in-memory kernel ring buffer");
     println("  selftest  : non-destructive kernel diagnostics");
+    println("  stability : selftest + bounded stress command");
     println("  metrics   : perf, irq, boot, bench");
 }
 
@@ -1001,7 +1009,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 20,
+        COMMANDS.len() >= 24,
         &mut passed,
         &mut failed,
     );
@@ -1015,6 +1023,98 @@ fn command_selftest(_arguments: &[u8]) {
         println("status: PASS");
     } else {
         serial::log("selftest", "failed");
+        stats::inc_shell_error();
+        println("status: FAIL");
+    }
+}
+
+fn command_stress(arguments: &[u8]) {
+    let cycles = match stress_cycles(arguments) {
+        Some(cycles) => cycles,
+        None => {
+            stats::inc_shell_error();
+            println("Usage: stress [1..32]");
+            return;
+        }
+    };
+
+    let ticks_before = interrupts::ticks();
+    let log_before = klog::snapshot();
+    let serial_before = stats::snapshot().serial_bytes;
+    let mut checksum = 0x544f_4241_4343_4f53u64;
+    let mut paging_failures = 0u64;
+
+    serial::log_u64("stress", "cycles", cycles as u64);
+    println("Tobacco stability stress:");
+    print_counter("cycles", cycles as u64);
+
+    for cycle in 0..cycles {
+        checksum = stress_cpu_round(checksum, cycle as u64);
+
+        if !stress_paging_round(cycle as u64, &mut checksum) {
+            paging_failures = paging_failures.saturating_add(1);
+        }
+
+        klog::append_u64("stress", "cycle", cycle as u64);
+    }
+
+    stress_log_ring_wrap();
+
+    let ticks_after = interrupts::ticks();
+    let log_after = klog::snapshot();
+    let serial_after = stats::snapshot().serial_bytes;
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+
+    selftest_check(
+        "paging repeated translation",
+        paging_failures == 0,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "kernel log bounded",
+        log_after.initialized
+            && log_after.capacity == klog::ENTRY_COUNT as u64
+            && log_after.count <= log_after.capacity,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "kernel log wrap monotonic",
+        log_after.next_sequence > log_before.next_sequence
+            && log_after.dropped >= log_before.dropped,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "timer monotonic",
+        ticks_after >= ticks_before,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "serial counter monotonic",
+        serial_after >= serial_before,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check("checksum stable", checksum != 0, &mut passed, &mut failed);
+
+    println("Stress summary:");
+    print_counter("passed", passed);
+    print_counter("failed", failed);
+    print("  checksum         : ");
+    print_hex_u64(checksum);
+    newline();
+    print_counter("log entries", log_after.count);
+    print_counter("log dropped", log_after.dropped);
+
+    if failed == 0 {
+        serial::log("stress", "passed");
+        println("status: PASS");
+    } else {
+        serial::log("stress", "failed");
         stats::inc_shell_error();
         println("status: FAIL");
     }
@@ -1094,6 +1194,54 @@ fn selftest_check(label: &str, ok: bool, passed: &mut u64, failed: &mut u64) {
         *failed = (*failed).saturating_add(1);
     }
     println(label);
+}
+
+fn stress_cpu_round(mut checksum: u64, cycle: u64) -> u64 {
+    for value in 0..2048u64 {
+        checksum = checksum
+            .rotate_left(9)
+            .wrapping_add(value ^ cycle.rotate_left(3))
+            .wrapping_mul(0x1000_0000_01b3);
+        checksum = core::hint::black_box(checksum);
+    }
+
+    checksum
+}
+
+fn stress_paging_round(cycle: u64, checksum: &mut u64) -> bool {
+    let rolling_address = (cycle % 512) * paging::HUGE_PAGE_SIZE;
+    let mapped_addresses = [
+        0,
+        0x1000,
+        VGA_BUFFER_ADDRESS,
+        rolling_address,
+        paging::BOOT_IDENTITY_MAP_BYTES - 1,
+    ];
+    let unmapped_addresses = [paging::BOOT_IDENTITY_MAP_BYTES, 0xffff_8000_0000_0000];
+
+    for address in mapped_addresses.iter().copied() {
+        let result = paging::translate(address);
+
+        if !result.mapped || result.phys != address {
+            return false;
+        }
+
+        *checksum ^= result.phys.rotate_left(((address >> 12) as u32 & 31) + 1);
+    }
+
+    for address in unmapped_addresses.iter().copied() {
+        if paging::translate(address).mapped {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn stress_log_ring_wrap() {
+    for index in 0..(klog::ENTRY_COUNT + 8) {
+        klog::append_u64("stress", "ring", index as u64);
+    }
 }
 
 fn print_bytes(bytes: u64) {
@@ -1267,6 +1415,26 @@ fn log_limit(arguments: &[u8], total: usize) -> usize {
             stats::inc_shell_error();
             16usize.min(total)
         }
+    }
+}
+
+fn stress_cycles(arguments: &[u8]) -> Option<usize> {
+    let arguments = trim_ascii(arguments);
+
+    if arguments.is_empty() {
+        return Some(STRESS_DEFAULT_CYCLES);
+    }
+
+    let value = parse_u64(arguments)?;
+    if value == 0 {
+        return None;
+    }
+
+    if value > STRESS_MAX_CYCLES as u64 {
+        println("cycles dibatasi ke 32 agar tetap aman.");
+        Some(STRESS_MAX_CYCLES)
+    } else {
+        Some(value as usize)
     }
 }
 
