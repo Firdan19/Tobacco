@@ -1,3 +1,4 @@
+use crate::stats;
 use x86_64::instructions::interrupts as cpu_interrupts;
 use x86_64::instructions::port::Port;
 
@@ -117,5 +118,6 @@ fn write_raw_byte(byte: u8) {
         while line_status.read() & 0x20 == 0 {}
 
         data.write(byte);
+        stats::inc_serial_byte();
     }
 }

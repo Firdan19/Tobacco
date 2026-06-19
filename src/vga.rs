@@ -1,3 +1,4 @@
+use crate::stats;
 use core::ptr::NonNull;
 use volatile::VolatilePtr;
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -55,6 +56,7 @@ impl Writer {
     }
 
     fn clear_screen(&mut self) {
+        stats::inc_vga_clear();
         self.hide_cursor();
 
         for offset in 0..(VGA_WIDTH * VGA_HEIGHT) {
@@ -338,6 +340,7 @@ impl Writer {
     }
 
     fn scroll_console_up(&mut self) {
+        stats::inc_vga_scroll();
         self.hide_cursor();
 
         for row in (CONSOLE_TOP + 1)..=CONSOLE_BOTTOM {
@@ -372,6 +375,7 @@ impl Writer {
     }
 
     fn toggle_cursor(&mut self) {
+        stats::inc_cursor_toggle();
         if self.cursor_visible {
             self.hide_cursor();
         } else {
@@ -410,6 +414,7 @@ impl Writer {
     }
 
     fn write_cell(&self, offset: usize, byte: u8, color_code: u8) {
+        stats::inc_vga_cell_write();
         let cell = unsafe { VolatilePtr::new(NonNull::new_unchecked(self.buffer.add(offset))) };
 
         cell.write(ScreenChar {

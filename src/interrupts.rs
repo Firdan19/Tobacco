@@ -1,5 +1,5 @@
 use crate::keyboard::KeyEvent;
-use crate::{keyboard, serial, vga};
+use crate::{keyboard, serial, stats, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -206,6 +206,7 @@ unsafe fn send_eoi(irq: u8) {
 
 #[no_mangle]
 pub extern "C" fn timer_interrupt_handler() {
+    stats::inc_timer_irq();
     PIT_TICKS.fetch_add(1, Ordering::Relaxed);
     vga::toggle_cursor();
 
@@ -216,6 +217,7 @@ pub extern "C" fn timer_interrupt_handler() {
 
 #[no_mangle]
 pub extern "C" fn keyboard_interrupt_handler() {
+    stats::inc_keyboard_irq();
     keyboard::handle_interrupt();
 
     unsafe {
@@ -225,6 +227,7 @@ pub extern "C" fn keyboard_interrupt_handler() {
 
 #[no_mangle]
 pub extern "C" fn default_irq_handler() {
+    stats::inc_default_irq();
     unsafe {
         send_eoi(TIMER_IRQ);
     }
@@ -232,6 +235,7 @@ pub extern "C" fn default_irq_handler() {
 
 #[no_mangle]
 pub extern "C" fn exception_handler() {
+    stats::inc_exception();
     cpu_interrupts::disable();
     serial::log("panic", "CPU fault captured");
     vga::show_panic_screen("CPU fault captured", "processor exception handler invoked");

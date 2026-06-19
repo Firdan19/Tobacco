@@ -1,3 +1,4 @@
+use crate::stats;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use x86_64::instructions::port::Port;
@@ -44,6 +45,7 @@ impl KeyBuffer {
         let next_write = (write + 1) % KEY_BUFFER_SIZE;
 
         if next_write == self.read_index.load(Ordering::Acquire) {
+            stats::inc_keyboard_dropped_event();
             return;
         }
 
@@ -53,6 +55,7 @@ impl KeyBuffer {
         }
 
         self.write_index.store(next_write, Ordering::Release);
+        stats::inc_keyboard_event();
     }
 
     fn pop(&self) -> Option<KeyEvent> {
@@ -148,6 +151,8 @@ fn read_scancode() -> u8 {
 }
 
 fn handle_scancode(scancode: u8) {
+    stats::inc_keyboard_scancode();
+
     if scancode == 0xe0 {
         EXTENDED_SCANCODE.store(true, Ordering::Release);
         return;

@@ -1,5 +1,5 @@
 use crate::keyboard::{self, KeyEvent};
-use crate::{interrupts, serial, vga};
+use crate::{interrupts, serial, stats, vga};
 use x86_64::instructions::interrupts as cpu_interrupts;
 
 const INPUT_BUFFER_SIZE: usize = 512;
@@ -17,7 +17,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 10] = [
+const COMMANDS: [Command; 14] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -67,6 +67,26 @@ const COMMANDS: [Command; 10] = [
         name: "keyboard",
         description: "status input keyboard PS/2",
         handler: command_keyboard,
+    },
+    Command {
+        name: "perf",
+        description: "tampilkan counter performa kernel",
+        handler: command_perf,
+    },
+    Command {
+        name: "irq",
+        description: "tampilkan counter interrupt",
+        handler: command_irq,
+    },
+    Command {
+        name: "boot",
+        description: "tampilkan status boot Phase 1",
+        handler: command_boot,
+    },
+    Command {
+        name: "bench",
+        description: "benchmark ringan kernel",
+        handler: command_bench,
     },
 ];
 
@@ -230,6 +250,7 @@ pub fn run() -> ! {
                     if let Some(index) = history.previous_index(history_selected) {
                         history_selected = Some(index);
                         if history.load(index, &mut input, &mut input_len, &mut cursor) {
+                            stats::inc_shell_history_recall();
                             vga::render_input_with_cursor(&input[..input_len], cursor);
                         }
                     }
@@ -238,6 +259,7 @@ pub fn run() -> ! {
                     if let Some(index) = history.next_index(history_selected) {
                         history_selected = Some(index);
                         if history.load(index, &mut input, &mut input_len, &mut cursor) {
+                            stats::inc_shell_history_recall();
                             vga::render_input_with_cursor(&input[..input_len], cursor);
                         }
                     } else if history_selected.is_some() {
@@ -320,11 +342,13 @@ fn execute(input: &[u8]) {
     let command_line = trim_ascii(input);
 
     if command_line.is_empty() {
+        stats::inc_shell_empty_command();
         serial::log("shell", "empty command ignored");
         return;
     }
 
     let (command, arguments) = split_command(command_line);
+    stats::inc_shell_command();
     serial::log_bytes("shell", "command", command);
 
     for command_entry in COMMANDS.iter() {
@@ -336,6 +360,7 @@ fn execute(input: &[u8]) {
     }
 
     serial::log_bytes("shell", "unknown command", command);
+    stats::inc_shell_error();
     println("Perintah tidak dikenal. Ketik help.");
 }
 
@@ -386,6 +411,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  irq       : IDT 256, PIC 8259 remap, PIT timer");
     println("  keyboard  : PS/2 IRQ1 event layer");
     println("  shell     : line editor, history, command table");
+    println("  metrics   : perf, irq, boot, bench");
 }
 
 fn command_mem(_arguments: &[u8]) {
@@ -434,6 +460,76 @@ fn command_keyboard(_arguments: &[u8]) {
     println(" event(s)");
 }
 
+fn command_perf(_arguments: &[u8]) {
+    let snapshot = stats::snapshot();
+
+    println("Performance counters:");
+    print_counter("vga cell writes", snapshot.vga_cell_writes);
+    print_counter("vga clears", snapshot.vga_clears);
+    print_counter("vga scrolls", snapshot.vga_scrolls);
+    print_counter("cursor toggles", snapshot.cursor_toggles);
+    print_counter("serial bytes", snapshot.serial_bytes);
+    print_counter("keyboard scancodes", snapshot.keyboard_scancodes);
+    print_counter("keyboard events", snapshot.keyboard_events);
+    print_counter("keyboard dropped", snapshot.keyboard_dropped_events);
+    print_counter("shell commands", snapshot.shell_commands);
+    print_counter("shell empty", snapshot.shell_empty_commands);
+    print_counter("shell errors", snapshot.shell_errors);
+    print_counter("history recalls", snapshot.shell_history_recalls);
+    print_counter("bench runs", snapshot.bench_runs);
+}
+
+fn command_irq(_arguments: &[u8]) {
+    let snapshot = stats::snapshot();
+
+    println("IRQ counters:");
+    print_counter("timer irq", snapshot.timer_irqs);
+    print_counter("keyboard irq", snapshot.keyboard_irqs);
+    print_counter("default irq", snapshot.default_irqs);
+    print_counter("exceptions", snapshot.exceptions);
+    print_counter("current ticks", interrupts::ticks());
+}
+
+fn command_boot(_arguments: &[u8]) {
+    let snapshot = stats::snapshot();
+
+    println("Boot status:");
+    println("  name          : Tobacco");
+    println("  version       : v0.0.5");
+    println("  mode          : x86_64 long mode");
+    println("  boot          : GRUB Multiboot2 ISO");
+    println("  page map      : 1 GiB identity map");
+    println("  serial log    : structured tags active");
+    print_counter("shell ready tick", snapshot.shell_ready_tick);
+    print_counter("current ticks", interrupts::ticks());
+}
+
+fn command_bench(_arguments: &[u8]) {
+    stats::inc_bench_run();
+
+    let start = interrupts::ticks();
+    let mut accumulator = 0x544f_4241_4343_4f00u64;
+
+    for value in 0..100_000u64 {
+        accumulator = accumulator
+            .rotate_left(7)
+            .wrapping_add(value ^ 0x9e37_79b9_7f4a_7c15);
+        accumulator = core::hint::black_box(accumulator);
+    }
+
+    let end = interrupts::ticks();
+    serial::log_u64("bench", "accumulator", accumulator);
+
+    println("Bench:");
+    print_counter("iterations", 100_000);
+    print_counter("start tick", start);
+    print_counter("end tick", end);
+    print_counter("delta ticks", end.saturating_sub(start));
+    print("  accumulator   : ");
+    print_hex_u64(accumulator);
+    newline();
+}
+
 fn split_command(input: &[u8]) -> (&[u8], &[u8]) {
     for index in 0..input.len() {
         if input[index] == b' ' || input[index] == b'\t' {
@@ -461,6 +557,15 @@ fn print_spaces(count: usize) {
         vga::write_byte(b' ');
         serial::write_byte(b' ');
     }
+}
+
+fn print_counter(label: &str, value: u64) {
+    print("  ");
+    print(label);
+    print_spaces(17usize.saturating_sub(label.len()));
+    print(": ");
+    print_u64(value);
+    newline();
 }
 
 fn print_ascii_line(bytes: &[u8]) {

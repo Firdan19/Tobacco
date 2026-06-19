@@ -9,6 +9,7 @@ mod interrupts;
 mod keyboard;
 mod serial;
 mod shell;
+mod stats;
 mod vga;
 
 core::arch::global_asm!(
@@ -129,6 +130,7 @@ pub extern "C" fn kernel_main() -> ! {
     keyboard::init();
     serial::log("keyboard", "ps/2 controller drained");
     interrupts::init();
+    stats::mark_shell_ready(interrupts::ticks());
 
     shell::run();
 }
