@@ -73,6 +73,20 @@ pub struct ExceptionContext {
 }
 
 #[derive(Clone, Copy)]
+pub struct AbiSnapshot {
+    pub idt_entry_bytes: u64,
+    pub exception_context_bytes: u64,
+    pub timer_gate_present: bool,
+    pub keyboard_gate_present: bool,
+    pub syscall_gate_present: bool,
+    pub syscall_gate_dpl3: bool,
+    pub double_fault_ist: bool,
+    pub pic_timer_vector: u64,
+    pub pic_keyboard_vector: u64,
+    pub syscall_vector: u64,
+}
+
+#[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct IdtEntry {
     offset_low: u16,
@@ -136,6 +150,7 @@ pub fn init() {
 
     cpu_interrupts::enable();
     serial::log("irq", "idt, pic, pit ready");
+    serial::log("irq", "interrupt abi hardened");
 }
 
 pub fn pop_key_event() -> Option<KeyEvent> {
@@ -152,6 +167,29 @@ pub fn ticks() -> u64 {
 
 pub fn syscall_gate_ready() -> bool {
     SYSCALL_GATE_READY.load(Ordering::Acquire)
+}
+
+pub fn abi_snapshot() -> AbiSnapshot {
+    unsafe {
+        let idt = core::ptr::addr_of!(IDT).cast::<IdtEntry>();
+        let timer = (*idt.add(TIMER_VECTOR)).options;
+        let keyboard = (*idt.add(KEYBOARD_VECTOR)).options;
+        let syscall = (*idt.add(SYSCALL_VECTOR)).options;
+        let double_fault = (*idt.add(8)).options;
+
+        AbiSnapshot {
+            idt_entry_bytes: size_of::<IdtEntry>() as u64,
+            exception_context_bytes: size_of::<ExceptionContext>() as u64,
+            timer_gate_present: gate_present(timer),
+            keyboard_gate_present: gate_present(keyboard),
+            syscall_gate_present: gate_present(syscall),
+            syscall_gate_dpl3: gate_dpl(syscall) == 3,
+            double_fault_ist: gate_ist(double_fault) == gdt::DOUBLE_FAULT_IST_INDEX,
+            pic_timer_vector: TIMER_VECTOR as u64,
+            pic_keyboard_vector: KEYBOARD_VECTOR as u64,
+            syscall_vector: SYSCALL_VECTOR as u64,
+        }
+    }
 }
 
 unsafe fn init_idt() {
@@ -394,6 +432,18 @@ fn log_page_fault_bits(error_code: u64) {
     serial::log_bool("panic", "page user", error_code & (1 << 2) != 0);
     serial::log_bool("panic", "page reserved", error_code & (1 << 3) != 0);
     serial::log_bool("panic", "page instruction", error_code & (1 << 4) != 0);
+}
+
+fn gate_present(options: u16) -> bool {
+    options & 0x8000 != 0
+}
+
+fn gate_dpl(options: u16) -> u16 {
+    (options >> 13) & 0x0003
+}
+
+fn gate_ist(options: u16) -> u16 {
+    options & 0x0007
 }
 
 fn read_cr2() -> u64 {

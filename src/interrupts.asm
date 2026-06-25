@@ -77,8 +77,45 @@ extern exception_dispatch_handler
     pop rax
 %endmacro
 
+%macro save_segments 0
+    xor rax, rax
+    mov ax, ds
+    push rax
+    xor rax, rax
+    mov ax, es
+    push rax
+    xor rax, rax
+    mov ax, fs
+    push rax
+    xor rax, rax
+    mov ax, gs
+    push rax
+%endmacro
+
+%macro load_kernel_segments 0
+    mov r10w, 0x10
+    mov ds, r10w
+    mov es, r10w
+    mov fs, r10w
+    mov gs, r10w
+%endmacro
+
+%macro restore_segments 0
+    mov r10, [rsp + 24]
+    mov ds, r10w
+    mov r10, [rsp + 16]
+    mov es, r10w
+    mov r10, [rsp + 8]
+    mov fs, r10w
+    mov r10, [rsp]
+    mov gs, r10w
+    add rsp, 32
+%endmacro
+
 %macro call_rust_handler 1
     push_regs
+    save_segments
+    load_kernel_segments
     mov rax, rsp
     and rsp, -16
     sub rsp, 16
@@ -86,6 +123,7 @@ extern exception_dispatch_handler
     cld
     call %1
     mov rsp, [rsp]
+    restore_segments
     pop_regs
     iretq
 %endmacro
@@ -111,15 +149,11 @@ keyboard_interrupt_stub:
 
 syscall_interrupt_stub:
     push_regs
-    mov r10w, 0x10
-    mov ds, r10w
-    mov es, r10w
-    mov ss, r10w
-    mov fs, r10w
-    mov gs, r10w
     mov rdx, rsp
-    mov rdi, [rsp + 112]
-    mov rsi, [rsp + 72]
+    save_segments
+    load_kernel_segments
+    mov rdi, [rdx + 112]
+    mov rsi, [rdx + 72]
     mov rax, rsp
     and rsp, -16
     sub rsp, 16
@@ -127,11 +161,7 @@ syscall_interrupt_stub:
     cld
     call syscall_dispatch_handler
     mov rsp, [rsp]
-    mov r10w, 0x2b
-    mov ds, r10w
-    mov es, r10w
-    mov fs, r10w
-    mov gs, r10w
+    restore_segments
     pop_regs
     iretq
 
@@ -174,6 +204,8 @@ exception_with_error exception_30_security_stub, 30
 exception_common_stub:
     push_regs
     lea rdi, [rsp + 120]
+    save_segments
+    load_kernel_segments
     mov rax, rsp
     and rsp, -16
     sub rsp, 16
@@ -181,6 +213,7 @@ exception_common_stub:
     cld
     call exception_dispatch_handler
     mov rsp, [rsp]
+    restore_segments
     pop_regs
     add rsp, 16
     iretq

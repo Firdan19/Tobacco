@@ -122,6 +122,7 @@ fn run_selftest_checks() -> bool {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let user_state = user::snapshot();
+    let interrupt_abi = interrupts::abi_snapshot();
 
     let mut ok = true;
 
@@ -184,6 +185,19 @@ fn run_selftest_checks() -> bool {
             && gdt.user_data_selector != 0
             && gdt.privilege_stack_bytes >= 16 * 1024
             && gdt.double_fault_stack_bytes >= 16 * 1024,
+    );
+    ok &= check(
+        "selftest interrupt abi hardened",
+        interrupt_abi.idt_entry_bytes == 16
+            && interrupt_abi.exception_context_bytes == 40
+            && interrupt_abi.timer_gate_present
+            && interrupt_abi.keyboard_gate_present
+            && interrupt_abi.syscall_gate_present
+            && interrupt_abi.syscall_gate_dpl3
+            && interrupt_abi.double_fault_ist
+            && interrupt_abi.pic_timer_vector == 32
+            && interrupt_abi.pic_keyboard_vector == 33
+            && interrupt_abi.syscall_vector == 0x80,
     );
     ok &= check(
         "selftest user mode foundation",

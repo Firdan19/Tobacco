@@ -739,6 +739,7 @@ fn command_diag(_arguments: &[u8]) {
     let gdt_state = gdt::snapshot();
     let panic = paniclog::snapshot();
     let user_state = user::snapshot();
+    let interrupt_abi = interrupts::abi_snapshot();
 
     serial::log("diag", "diagnostic report requested");
     println("Tobacco diagnostics:");
@@ -770,6 +771,10 @@ fn command_diag(_arguments: &[u8]) {
     print("  gdt/tss      : ");
     print_on_off(gdt_state.loaded);
     newline();
+    print("  irq abi      : ");
+    print_on_off(interrupt_abi_is_healthy(interrupt_abi));
+    newline();
+    print_counter("syscall vector", interrupt_abi.syscall_vector);
     print("  user mode    : ");
     print_on_off(user_state.initialized && user_state.syscall_gate_ready);
     newline();
@@ -829,6 +834,7 @@ fn print_health_report() -> u64 {
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
     let user_state = user::snapshot();
+    let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
 
     println("Tobacco health:");
@@ -875,6 +881,11 @@ fn print_health_report() -> u64 {
         &mut issues,
     );
     health_line(
+        "interrupt abi",
+        interrupt_abi_is_healthy(interrupt_abi),
+        &mut issues,
+    );
+    health_line(
         "user mode",
         user_state.initialized
             && user_state.code_mapped
@@ -915,6 +926,7 @@ fn health_issue_count() -> u64 {
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
     let user_state = user::snapshot();
+    let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
 
     count_issue(
@@ -952,6 +964,7 @@ fn health_issue_count() -> u64 {
             && gdt_state.user_data_selector != 0,
         &mut issues,
     );
+    count_issue(interrupt_abi_is_healthy(interrupt_abi), &mut issues);
     count_issue(
         user_state.initialized
             && user_state.code_mapped
@@ -970,6 +983,19 @@ fn health_issue_count() -> u64 {
     count_issue(!panic.present, &mut issues);
 
     issues
+}
+
+fn interrupt_abi_is_healthy(snapshot: interrupts::AbiSnapshot) -> bool {
+    snapshot.idt_entry_bytes == 16
+        && snapshot.exception_context_bytes == 40
+        && snapshot.timer_gate_present
+        && snapshot.keyboard_gate_present
+        && snapshot.syscall_gate_present
+        && snapshot.syscall_gate_dpl3
+        && snapshot.double_fault_ist
+        && snapshot.pic_timer_vector == 32
+        && snapshot.pic_keyboard_vector == 33
+        && snapshot.syscall_vector == 0x80
 }
 
 fn health_line(label: &str, ok: bool, issues: &mut u64) {
@@ -1663,6 +1689,7 @@ fn command_selftest(_arguments: &[u8]) {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let user_state = user::snapshot();
+    let interrupt_abi = interrupts::abi_snapshot();
 
     let mut passed = 0u64;
     let mut failed = 0u64;
@@ -1757,6 +1784,12 @@ fn command_selftest(_arguments: &[u8]) {
             && gdt.user_data_selector != 0
             && gdt.privilege_stack_bytes >= STACK_BYTES
             && gdt.double_fault_stack_bytes >= STACK_BYTES,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "interrupt abi hardened",
+        interrupt_abi_is_healthy(interrupt_abi),
         &mut passed,
         &mut failed,
     );
