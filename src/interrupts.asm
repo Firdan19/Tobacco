@@ -4,6 +4,7 @@ section .text.interrupts
 
 global timer_interrupt_stub
 global keyboard_interrupt_stub
+global syscall_interrupt_stub
 global default_irq_stub
 global default_interrupt_stub
 global default_exception_with_error_stub
@@ -31,9 +32,12 @@ global exception_28_hypervisor_injection_stub
 global exception_29_vmm_communication_stub
 global exception_30_security_stub
 global ci_trigger_double_fault_stub
+global user_enter
+global user_return_to_kernel
 
 extern timer_interrupt_handler
 extern keyboard_interrupt_handler
+extern syscall_dispatch_handler
 extern default_irq_handler
 extern exception_dispatch_handler
 
@@ -105,6 +109,19 @@ timer_interrupt_stub:
 keyboard_interrupt_stub:
     call_rust_handler keyboard_interrupt_handler
 
+syscall_interrupt_stub:
+    push_regs
+    mov rdi, rsp
+    mov rax, rsp
+    and rsp, -16
+    sub rsp, 16
+    mov [rsp], rax
+    cld
+    call syscall_dispatch_handler
+    mov rsp, [rsp]
+    pop_regs
+    iretq
+
 default_irq_stub:
     call_rust_handler default_irq_handler
 
@@ -162,3 +179,51 @@ ci_trigger_double_fault_stub:
 .halt:
     hlt
     jmp .halt
+
+user_enter:
+    push rbp
+    mov rbp, rsp
+    mov [rel user_return_rsp], rsp
+    lea rax, [rel .return_from_user]
+    mov [rel user_return_rip], rax
+
+    mov ax, dx
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    push rdx
+    push rsi
+    pushfq
+    pop rax
+    or rax, 0x200
+    push rax
+    push rcx
+    push rdi
+    iretq
+
+.return_from_user:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov fs, ax
+    mov gs, ax
+    mov rax, [rel user_exit_code]
+    pop rbp
+    ret
+
+user_return_to_kernel:
+    mov [rel user_exit_code], rdi
+    mov rsp, [rel user_return_rsp]
+    jmp [rel user_return_rip]
+
+section .bss.user
+align 8
+user_return_rsp:
+    resq 1
+user_return_rip:
+    resq 1
+user_exit_code:
+    resq 1

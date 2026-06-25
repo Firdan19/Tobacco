@@ -1,5 +1,6 @@
 use crate::{
-    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats, vga,
+    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, serial, shell, stats, user,
+    vga,
 };
 use x86_64::instructions::hlt;
 
@@ -49,6 +50,12 @@ pub fn run_if_requested() {
         serial::log("ci", "console status: FAIL");
     }
 
+    if run_user_mode_checks() {
+        serial::log("ci", "user mode status: PASS");
+    } else {
+        serial::log("ci", "user mode status: FAIL");
+    }
+
     serial::log("ci", "command smoke complete");
 }
 
@@ -94,6 +101,9 @@ fn run_command_table_checks() {
     check("command paging", shell::command_exists(b"paging"));
     check("command heap", shell::command_exists(b"heap"));
     check("command vmtest", shell::command_exists(b"vmtest"));
+    check("command user", shell::command_exists(b"user"));
+    check("command usertest", shell::command_exists(b"usertest"));
+    check("command syscall", shell::command_exists(b"syscall"));
     check("command consoletest", shell::command_exists(b"consoletest"));
     check("command mem", shell::command_exists(b"mem"));
     check("command log", shell::command_exists(b"log"));
@@ -111,6 +121,7 @@ fn run_selftest_checks() -> bool {
     let log = klog::snapshot();
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
+    let user_state = user::snapshot();
 
     let mut ok = true;
 
@@ -169,7 +180,17 @@ fn run_selftest_checks() -> bool {
             && gdt.code_selector != 0
             && gdt.data_selector != 0
             && gdt.tss_selector != 0
+            && gdt.user_code_selector != 0
+            && gdt.user_data_selector != 0
+            && gdt.privilege_stack_bytes >= 16 * 1024
             && gdt.double_fault_stack_bytes >= 16 * 1024,
+    );
+    ok &= check(
+        "selftest user mode foundation",
+        user_state.initialized
+            && user_state.code_mapped
+            && user_state.stack_mapped
+            && user_state.syscall_gate_ready,
     );
     ok &= check(
         "selftest kernel log ready",
@@ -185,7 +206,27 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 32);
+    ok &= check("selftest command table sane", shell::command_count() >= 35);
+
+    ok
+}
+
+fn run_user_mode_checks() -> bool {
+    let before = user::snapshot();
+    let result = user::run_probe();
+    let after = user::snapshot();
+    let mut ok = true;
+
+    ok &= check("user mode initialized", before.initialized);
+    ok &= check("user syscall gate ready", before.syscall_gate_ready);
+    ok &= check("user probe ran", result.ran);
+    ok &= check("user probe exit code", result.exit_code == 42);
+    ok &= check(
+        "user probe syscalls",
+        result.syscalls_after >= result.syscalls_before + 3,
+    );
+    ok &= check("user probe passed", result.passed);
+    ok &= check("user pass counter", after.pass_count > before.pass_count);
 
     ok
 }

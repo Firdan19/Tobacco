@@ -15,12 +15,18 @@ pub const KERNEL_HEAP_BASE: u64 = KERNEL_HEAP_GUARD_LOW + PAGE_SIZE_4K;
 pub const KERNEL_HEAP_SIZE: u64 = 64 * 1024;
 pub const KERNEL_HEAP_GUARD_HIGH: u64 = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE;
 pub const KERNEL_VM_TEST_PAGE: u64 = KERNEL_VIRTUAL_BASE + 0x0200_0000;
+pub const USER_SPACE_BASE: u64 = KERNEL_VIRTUAL_BASE + 0x0300_0000;
+pub const USER_PROBE_CODE_PAGE: u64 = USER_SPACE_BASE;
+pub const USER_PROBE_STACK_PAGE: u64 = USER_SPACE_BASE + PAGE_SIZE_4K;
+pub const USER_PROBE_STACK_TOP: u64 = USER_PROBE_STACK_PAGE + PAGE_SIZE_4K;
 
 const PAGE_TABLE_ENTRIES: usize = 512;
 const ENTRY_PRESENT: u64 = 1 << 0;
 const ENTRY_WRITABLE: u64 = 1 << 1;
+const ENTRY_USER: u64 = 1 << 2;
 const ENTRY_HUGE_PAGE: u64 = 1 << 7;
 const DEFAULT_PAGE_FLAGS: u64 = ENTRY_PRESENT | ENTRY_WRITABLE;
+const USER_PAGE_FLAGS: u64 = DEFAULT_PAGE_FLAGS | ENTRY_USER;
 const ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffe0_0000;
 
@@ -56,6 +62,7 @@ pub struct TranslateResult {
     pub phys: u64,
     pub mapped: bool,
     pub huge_page: bool,
+    pub user_accessible: bool,
     pub page_size: u64,
 }
 
@@ -173,6 +180,7 @@ pub fn translate(virt: u64) -> TranslateResult {
     if !entry_present(p4_entry) {
         return unmapped(virt);
     }
+    let mut user_accessible = entry_user(p4_entry);
 
     let Some(p3) = table_from_entry(p4_entry) else {
         return unmapped(virt);
@@ -182,6 +190,7 @@ pub fn translate(virt: u64) -> TranslateResult {
     if !entry_present(p3_entry) {
         return unmapped(virt);
     }
+    user_accessible &= entry_user(p3_entry);
 
     let Some(p2) = table_from_entry(p3_entry) else {
         return unmapped(virt);
@@ -191,6 +200,7 @@ pub fn translate(virt: u64) -> TranslateResult {
     if !entry_present(p2_entry) {
         return unmapped(virt);
     }
+    user_accessible &= entry_user(p2_entry);
 
     if entry_huge(p2_entry) {
         return TranslateResult {
@@ -198,6 +208,7 @@ pub fn translate(virt: u64) -> TranslateResult {
             phys: huge_entry_addr(p2_entry).saturating_add(huge_offset),
             mapped: true,
             huge_page: true,
+            user_accessible: user_accessible && entry_user(p2_entry),
             page_size: HUGE_PAGE_SIZE,
         };
     }
@@ -210,12 +221,14 @@ pub fn translate(virt: u64) -> TranslateResult {
     if !entry_present(p1_entry) {
         return unmapped(virt);
     }
+    user_accessible &= entry_user(p1_entry);
 
     TranslateResult {
         virt,
         phys: entry_addr(p1_entry).saturating_add(virt & (PAGE_SIZE_4K - 1)),
         mapped: true,
         huge_page: false,
+        user_accessible,
         page_size: PAGE_SIZE_4K,
     }
 }
@@ -248,6 +261,10 @@ pub fn map_new_page(virt: u64) -> Result<u64, MapError> {
 
 pub fn map_page(virt: u64, phys: u64) -> Result<(), MapError> {
     cpu_interrupts::without_interrupts(|| map_page_inner(virt, phys))
+}
+
+pub fn map_user_page(virt: u64, phys: u64) -> Result<(), MapError> {
+    cpu_interrupts::without_interrupts(|| map_page_inner_with_flags(virt, phys, USER_PAGE_FLAGS))
 }
 
 pub fn unmap_page(virt: u64) -> Result<u64, UnmapError> {
@@ -317,6 +334,7 @@ fn unmapped(virt: u64) -> TranslateResult {
         phys: 0,
         mapped: false,
         huge_page: false,
+        user_accessible: false,
         page_size: 0,
     }
 }
@@ -374,6 +392,10 @@ fn count_huge_entries(table: &[u64; PAGE_TABLE_ENTRIES]) -> u64 {
 }
 
 fn map_page_inner(virt: u64, phys: u64) -> Result<(), MapError> {
+    map_page_inner_with_flags(virt, phys, DEFAULT_PAGE_FLAGS)
+}
+
+fn map_page_inner_with_flags(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
     if !is_page_aligned(virt) {
         return Err(MapError::VirtualUnaligned);
     }
@@ -396,20 +418,20 @@ fn map_page_inner(virt: u64, phys: u64) -> Result<(), MapError> {
     let p1_index = ((virt >> 12) & 0x1ff) as usize;
 
     let p4 = boot_p4_mut();
-    let p3 = ensure_next_table(&mut p4[p4_index])?;
-    let p2 = ensure_next_table(&mut p3[p3_index])?;
+    let p3 = ensure_next_table(&mut p4[p4_index], flags)?;
+    let p2 = ensure_next_table(&mut p3[p3_index], flags)?;
 
     if entry_huge(p2[p2_index]) {
         return Err(MapError::HugePageConflict);
     }
 
-    let p1 = ensure_next_table(&mut p2[p2_index])?;
+    let p1 = ensure_next_table(&mut p2[p2_index], flags)?;
 
     if entry_present(p1[p1_index]) {
         return Err(MapError::AlreadyMapped);
     }
 
-    p1[p1_index] = phys | DEFAULT_PAGE_FLAGS;
+    p1[p1_index] = phys | flags;
     let state = mapper_state_mut();
     state.mapped_pages = state.mapped_pages.saturating_add(1);
     invlpg(virt);
@@ -464,12 +486,16 @@ fn unmap_page_inner(virt: u64) -> Result<u64, UnmapError> {
     Ok(entry_addr(entry))
 }
 
-fn ensure_next_table(entry: &mut u64) -> Result<&'static mut [u64; PAGE_TABLE_ENTRIES], MapError> {
+fn ensure_next_table(
+    entry: &mut u64,
+    flags: u64,
+) -> Result<&'static mut [u64; PAGE_TABLE_ENTRIES], MapError> {
     if entry_present(*entry) {
         if entry_huge(*entry) {
             return Err(MapError::HugePageConflict);
         }
 
+        *entry |= flags & (ENTRY_WRITABLE | ENTRY_USER);
         return table_from_entry_mut(*entry).ok_or(MapError::PhysicalNotIdentityMapped);
     }
 
@@ -479,7 +505,7 @@ fn ensure_next_table(entry: &mut u64) -> Result<&'static mut [u64; PAGE_TABLE_EN
     }
 
     zero_frame(frame);
-    *entry = frame | DEFAULT_PAGE_FLAGS;
+    *entry = frame | flags;
     let state = mapper_state_mut();
     state.page_table_frames = state.page_table_frames.saturating_add(1);
 
@@ -534,6 +560,10 @@ fn entry_present(entry: u64) -> bool {
 
 fn entry_huge(entry: u64) -> bool {
     entry & ENTRY_HUGE_PAGE != 0
+}
+
+fn entry_user(entry: u64) -> bool {
+    entry & ENTRY_USER != 0
 }
 
 fn entry_addr(entry: u64) -> u64 {

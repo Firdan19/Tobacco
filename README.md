@@ -43,6 +43,10 @@ Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI servi
 - GDT
 - TSS
 - IST untuk fault handling
+- Ring 3 user mode probe
+- User page mapping terbatas
+- Syscall gate `int 0x80`
+- Minimal syscall ABI
 - Panic screen
 - Exception screen
 - Page fault handler
@@ -91,6 +95,9 @@ Belum masuk ke GUI, filesystem besar, user space kompleks, plugin, atau AI servi
 - `perf`
 - `irq`
 - `boot`
+- `user`
+- `usertest`
+- `syscall`
 - `gdt`
 - `paging`
 - `heap`
@@ -142,12 +149,11 @@ Tobacco tetap berada di Phase 1 sampai fondasi kernel benar-benar kokoh
 
 Target berikutnya
 
-- User mode / Ring 3
-- Syscall ABI minimal
+- Syscall ABI lanjutan
 - Process Control Block
 - Scheduler awal
 - Memory isolation lebih matang
-- User program pertama
+- User program loader pertama
 - ELF loader sederhana
 - IPC dasar
 - Fault isolation untuk user process

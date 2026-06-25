@@ -18,6 +18,9 @@ pub struct Snapshot {
     pub cursor_toggles: u64,
     pub serial_bytes: u64,
     pub bench_runs: u64,
+    pub syscalls: u64,
+    pub user_probes: u64,
+    pub user_probe_passes: u64,
     pub shell_ready_tick: u64,
 }
 
@@ -38,6 +41,9 @@ static VGA_SCROLLS: AtomicU64 = AtomicU64::new(0);
 static CURSOR_TOGGLES: AtomicU64 = AtomicU64::new(0);
 static SERIAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static BENCH_RUNS: AtomicU64 = AtomicU64::new(0);
+static SYSCALLS: AtomicU64 = AtomicU64::new(0);
+static USER_PROBES: AtomicU64 = AtomicU64::new(0);
+static USER_PROBE_PASSES: AtomicU64 = AtomicU64::new(0);
 static SHELL_READY_TICK: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc_timer_irq() {
@@ -108,6 +114,18 @@ pub fn inc_bench_run() {
     BENCH_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn inc_syscall() {
+    SYSCALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_user_probe() {
+    USER_PROBES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_user_probe_pass() {
+    USER_PROBE_PASSES.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn mark_shell_ready(tick: u64) {
     SHELL_READY_TICK.store(tick, Ordering::Release);
 }
@@ -131,6 +149,9 @@ pub fn snapshot() -> Snapshot {
         cursor_toggles: CURSOR_TOGGLES.load(Ordering::Relaxed),
         serial_bytes: SERIAL_BYTES.load(Ordering::Relaxed),
         bench_runs: BENCH_RUNS.load(Ordering::Relaxed),
+        syscalls: SYSCALLS.load(Ordering::Relaxed),
+        user_probes: USER_PROBES.load(Ordering::Relaxed),
+        user_probe_passes: USER_PROBE_PASSES.load(Ordering::Relaxed),
         shell_ready_tick: SHELL_READY_TICK.load(Ordering::Acquire),
     }
 }

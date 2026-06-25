@@ -18,6 +18,7 @@ mod physmem;
 mod serial;
 mod shell;
 mod stats;
+mod user;
 mod vga;
 
 core::arch::global_asm!(
@@ -174,6 +175,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     );
     let heap_state = heap::init();
     serial::log_u64("heap", "heap bytes", heap_state.size);
+    user::init();
 
     vga::init();
     vga::show_splash();

@@ -1,4 +1,5 @@
 use crate::keyboard::{self, KeyEvent};
+use crate::user;
 use crate::{
     gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, serial, stats, vga,
 };
@@ -18,7 +19,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 32] = [
+const COMMANDS: [Command; 35] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -128,6 +129,21 @@ const COMMANDS: [Command; 32] = [
         name: "boot",
         description: "tampilkan status boot Phase 1",
         handler: command_boot,
+    },
+    Command {
+        name: "user",
+        description: "status Ring 3 dan user mode",
+        handler: command_user,
+    },
+    Command {
+        name: "usertest",
+        description: "jalankan probe Ring 3 + syscall",
+        handler: command_usertest,
+    },
+    Command {
+        name: "syscall",
+        description: "tampilkan ABI syscall minimal",
+        handler: command_syscall,
     },
     Command {
         name: "gdt",
@@ -722,6 +738,7 @@ fn command_diag(_arguments: &[u8]) {
     let counters = stats::snapshot();
     let gdt_state = gdt::snapshot();
     let panic = paniclog::snapshot();
+    let user_state = user::snapshot();
 
     serial::log("diag", "diagnostic report requested");
     println("Tobacco diagnostics:");
@@ -753,6 +770,11 @@ fn command_diag(_arguments: &[u8]) {
     print("  gdt/tss      : ");
     print_on_off(gdt_state.loaded);
     newline();
+    print("  user mode    : ");
+    print_on_off(user_state.initialized && user_state.syscall_gate_ready);
+    newline();
+    print_counter("syscalls", user_state.syscall_count);
+    print_counter("user probes", user_state.run_count);
     print("  last panic   : ");
     print_on_off(panic.present);
     newline();
@@ -806,6 +828,7 @@ fn print_health_report() -> u64 {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
+    let user_state = user::snapshot();
     let mut issues = 0u64;
 
     println("Tobacco health:");
@@ -844,7 +867,19 @@ fn print_health_report() -> u64 {
     );
     health_line(
         "gdt/tss/ist",
-        gdt_state.loaded && gdt_state.double_fault_stack_bytes >= STACK_BYTES,
+        gdt_state.loaded
+            && gdt_state.privilege_stack_bytes >= STACK_BYTES
+            && gdt_state.double_fault_stack_bytes >= STACK_BYTES
+            && gdt_state.user_code_selector != 0
+            && gdt_state.user_data_selector != 0,
+        &mut issues,
+    );
+    health_line(
+        "user mode",
+        user_state.initialized
+            && user_state.code_mapped
+            && user_state.stack_mapped
+            && user_state.syscall_gate_ready,
         &mut issues,
     );
     health_line(
@@ -863,7 +898,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 32, &mut issues);
+    health_line("command table", COMMANDS.len() >= 35, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -879,6 +914,7 @@ fn health_issue_count() -> u64 {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
+    let user_state = user::snapshot();
     let mut issues = 0u64;
 
     count_issue(
@@ -909,7 +945,18 @@ fn health_issue_count() -> u64 {
         &mut issues,
     );
     count_issue(
-        gdt_state.loaded && gdt_state.double_fault_stack_bytes >= STACK_BYTES,
+        gdt_state.loaded
+            && gdt_state.privilege_stack_bytes >= STACK_BYTES
+            && gdt_state.double_fault_stack_bytes >= STACK_BYTES
+            && gdt_state.user_code_selector != 0
+            && gdt_state.user_data_selector != 0,
+        &mut issues,
+    );
+    count_issue(
+        user_state.initialized
+            && user_state.code_mapped
+            && user_state.stack_mapped
+            && user_state.syscall_gate_ready,
         &mut issues,
     );
     count_issue(log.initialized && log.count <= log.capacity, &mut issues);
@@ -919,7 +966,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 32, &mut issues);
+    count_issue(COMMANDS.len() >= 35, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -955,6 +1002,7 @@ fn command_sysinfo(_arguments: &[u8]) {
     println("  paging    : boot identity map inspector");
     println("  vmm       : high-half mapper, guard pages, heap");
     println("  gdt/tss   : double fault IST stack");
+    println("  user mode : Ring 3 probe pages + int 0x80 syscall gate");
     println("  exceptions: vector-specific panic diagnostics");
     println("  shell     : line editor, history, command table");
     println("  klog      : in-memory kernel ring buffer");
@@ -1236,6 +1284,9 @@ fn command_perf(_arguments: &[u8]) {
     print_counter("shell errors", snapshot.shell_errors);
     print_counter("history recalls", snapshot.shell_history_recalls);
     print_counter("bench runs", snapshot.bench_runs);
+    print_counter("syscalls", snapshot.syscalls);
+    print_counter("user probes", snapshot.user_probes);
+    print_counter("user probe pass", snapshot.user_probe_passes);
 }
 
 fn command_irq(_arguments: &[u8]) {
@@ -1293,6 +1344,9 @@ fn command_boot(_arguments: &[u8]) {
     print("  gdt/tss       : ");
     print_on_off(gdt.loaded);
     newline();
+    print("  user mode     : ");
+    print_on_off(user::snapshot().initialized);
+    newline();
     print("  paging        : ");
     print_on_off(paging.initialized);
     newline();
@@ -1311,6 +1365,76 @@ fn command_boot(_arguments: &[u8]) {
     print_counter("current ticks", interrupts::ticks());
 }
 
+fn command_user(_arguments: &[u8]) {
+    let snapshot = user::snapshot();
+    let code = paging::translate(snapshot.code_virtual);
+    let stack = paging::translate(paging::USER_PROBE_STACK_PAGE);
+
+    println("User mode:");
+    print("  initialized       : ");
+    print_on_off(snapshot.initialized);
+    newline();
+    print("  syscall gate      : ");
+    print_on_off(snapshot.syscall_gate_ready);
+    newline();
+    print("  code selector     : ");
+    print_hex_u64(snapshot.code_selector as u64);
+    newline();
+    print("  data selector     : ");
+    print_hex_u64(snapshot.data_selector as u64);
+    newline();
+    print_counter("syscall vector", snapshot.syscall_vector);
+    print("  code virt         : ");
+    print_hex_u64(snapshot.code_virtual);
+    print(" ");
+    print_on_off(code.mapped && code.user_accessible);
+    newline();
+    print("  stack top         : ");
+    print_hex_u64(snapshot.stack_top);
+    newline();
+    print("  stack page        : ");
+    print_hex_u64(paging::USER_PROBE_STACK_PAGE);
+    print(" ");
+    print_on_off(stack.mapped && stack.user_accessible);
+    newline();
+    print_counter("runs", snapshot.run_count);
+    print_counter("passes", snapshot.pass_count);
+    print_counter("syscalls", snapshot.syscall_count);
+    print_counter("last exit", snapshot.last_exit_code);
+    print_counter("last uptime", snapshot.last_uptime_return);
+}
+
+fn command_usertest(_arguments: &[u8]) {
+    let result = user::run_probe();
+
+    println("User mode probe:");
+    print("  ran              : ");
+    print_on_off(result.ran);
+    newline();
+    print_counter("exit code", result.exit_code);
+    print_counter("syscalls before", result.syscalls_before);
+    print_counter("syscalls after", result.syscalls_after);
+    print("  status           : ");
+
+    if result.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
+fn command_syscall(_arguments: &[u8]) {
+    println("Syscall ABI:");
+    println("  gate      : int 0x80");
+    println("  number    : rax");
+    println("  arg0      : rdi");
+    println("  return    : rax");
+    println("  1 log     : rdi = message id");
+    println("  2 uptime  : return timer ticks");
+    println("  3 exit    : rdi = exit code");
+}
+
 fn command_gdt(_arguments: &[u8]) {
     let snapshot = gdt::snapshot();
 
@@ -1327,6 +1451,12 @@ fn command_gdt(_arguments: &[u8]) {
     print("  tss selector    : ");
     print_hex_u64(snapshot.tss_selector as u64);
     newline();
+    print("  user code sel   : ");
+    print_hex_u64(snapshot.user_code_selector as u64);
+    newline();
+    print("  user data sel   : ");
+    print_hex_u64(snapshot.user_data_selector as u64);
+    newline();
     print("  gdt base        : ");
     print_hex_u64(snapshot.gdt_base);
     newline();
@@ -1335,6 +1465,12 @@ fn command_gdt(_arguments: &[u8]) {
     print_hex_u64(snapshot.tss_base);
     newline();
     print_counter("tss limit", snapshot.tss_limit as u64);
+    print("  ring0 stack top : ");
+    print_hex_u64(snapshot.privilege_stack_top);
+    newline();
+    print("  ring0 stack     : ");
+    print_bytes(snapshot.privilege_stack_bytes);
+    newline();
     print_counter("df ist index", snapshot.double_fault_ist_index as u64);
     print("  df stack top    : ");
     print_hex_u64(snapshot.double_fault_stack_top);
@@ -1526,6 +1662,7 @@ fn command_selftest(_arguments: &[u8]) {
     let log = klog::snapshot();
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
+    let user_state = user::snapshot();
 
     let mut passed = 0u64;
     let mut failed = 0u64;
@@ -1616,7 +1753,19 @@ fn command_selftest(_arguments: &[u8]) {
             && gdt.code_selector != 0
             && gdt.data_selector != 0
             && gdt.tss_selector != 0
+            && gdt.user_code_selector != 0
+            && gdt.user_data_selector != 0
+            && gdt.privilege_stack_bytes >= STACK_BYTES
             && gdt.double_fault_stack_bytes >= STACK_BYTES,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "user mode foundation",
+        user_state.initialized
+            && user_state.code_mapped
+            && user_state.stack_mapped
+            && user_state.syscall_gate_ready,
         &mut passed,
         &mut failed,
     );
@@ -1652,7 +1801,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 32,
+        COMMANDS.len() >= 35,
         &mut passed,
         &mut failed,
     );

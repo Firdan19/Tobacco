@@ -1,7 +1,7 @@
 use crate::keyboard::KeyEvent;
 use crate::{gdt, keyboard, paging, paniclog, serial, stats, vga};
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::lidt;
@@ -10,6 +10,7 @@ use x86_64::VirtAddr;
 
 const IDT_ENTRIES: usize = 256;
 const INTERRUPT_GATE: u16 = 0x8e00;
+const INTERRUPT_GATE_DPL3: u16 = 0xee00;
 
 const PIC_1_COMMAND: u16 = 0x20;
 const PIC_1_DATA: u16 = 0x21;
@@ -23,6 +24,7 @@ const TIMER_IRQ: u8 = 0;
 const KEYBOARD_IRQ: u8 = 1;
 const TIMER_VECTOR: usize = (PIC_1_OFFSET + TIMER_IRQ) as usize;
 const KEYBOARD_VECTOR: usize = (PIC_1_OFFSET + KEYBOARD_IRQ) as usize;
+pub const SYSCALL_VECTOR: usize = 0x80;
 
 const PIT_COMMAND_PORT: u16 = 0x43;
 const PIT_CHANNEL_0_PORT: u16 = 0x40;
@@ -32,6 +34,7 @@ const PIT_DIVISOR_18HZ: u16 = 65535;
 unsafe extern "C" {
     fn timer_interrupt_stub();
     fn keyboard_interrupt_stub();
+    fn syscall_interrupt_stub();
     fn default_irq_stub();
     fn default_interrupt_stub();
     fn exception_00_divide_error_stub();
@@ -99,11 +102,19 @@ impl IdtEntry {
     }
 
     fn set_handler_with_ist(&mut self, handler: unsafe extern "C" fn(), ist_index: u16) {
+        self.set_handler_with_options(handler, INTERRUPT_GATE | (ist_index & 0x0007));
+    }
+
+    fn set_user_handler(&mut self, handler: unsafe extern "C" fn()) {
+        self.set_handler_with_options(handler, INTERRUPT_GATE_DPL3);
+    }
+
+    fn set_handler_with_options(&mut self, handler: unsafe extern "C" fn(), options: u16) {
         let address = handler as usize as u64;
 
         self.offset_low = address as u16;
         self.selector = gdt::KERNEL_CODE_SELECTOR;
-        self.options = INTERRUPT_GATE | (ist_index & 0x0007);
+        self.options = options;
         self.offset_mid = (address >> 16) as u16;
         self.offset_high = (address >> 32) as u32;
         self.reserved = 0;
@@ -112,6 +123,7 @@ impl IdtEntry {
 
 static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::missing(); IDT_ENTRIES];
 static PIT_TICKS: AtomicU64 = AtomicU64::new(0);
+static SYSCALL_GATE_READY: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
     cpu_interrupts::disable();
@@ -136,6 +148,10 @@ pub fn poll_keyboard() {
 
 pub fn ticks() -> u64 {
     PIT_TICKS.load(Ordering::Acquire)
+}
+
+pub fn syscall_gate_ready() -> bool {
+    SYSCALL_GATE_READY.load(Ordering::Acquire)
 }
 
 unsafe fn init_idt() {
@@ -183,7 +199,9 @@ unsafe fn init_idt() {
     unsafe {
         (*idt.add(TIMER_VECTOR)).set_handler(timer_interrupt_stub);
         (*idt.add(KEYBOARD_VECTOR)).set_handler(keyboard_interrupt_stub);
+        (*idt.add(SYSCALL_VECTOR)).set_user_handler(syscall_interrupt_stub);
     }
+    SYSCALL_GATE_READY.store(true, Ordering::Release);
 
     let idt_ptr = DescriptorTablePointer {
         limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,

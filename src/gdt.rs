@@ -4,12 +4,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 pub const TSS_SELECTOR: u16 = 0x18;
+pub const USER_DATA_SELECTOR: u16 = 0x2b;
+pub const USER_CODE_SELECTOR: u16 = 0x33;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 1;
 
-const GDT_ENTRY_COUNT: usize = 5;
+const GDT_ENTRY_COUNT: usize = 7;
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+const PRIVILEGE_STACK_SIZE: usize = 16 * 1024;
 const KERNEL_CODE_DESCRIPTOR: u64 = 0x00af_9a00_0000_ffff;
 const KERNEL_DATA_DESCRIPTOR: u64 = 0x00cf_9200_0000_ffff;
+const USER_DATA_DESCRIPTOR: u64 = 0x00cf_f200_0000_ffff;
+const USER_CODE_DESCRIPTOR: u64 = 0x00af_fa00_0000_ffff;
 const TSS_AVAILABLE_DESCRIPTOR: u64 = 0x89;
 
 #[derive(Clone, Copy)]
@@ -18,11 +23,15 @@ pub struct Snapshot {
     pub code_selector: u16,
     pub data_selector: u16,
     pub tss_selector: u16,
+    pub user_code_selector: u16,
+    pub user_data_selector: u16,
     pub double_fault_ist_index: u16,
     pub gdt_base: u64,
     pub gdt_limit: u16,
     pub tss_base: u64,
     pub tss_limit: u16,
+    pub privilege_stack_top: u64,
+    pub privilege_stack_bytes: u64,
     pub double_fault_stack_top: u64,
     pub double_fault_stack_bytes: u64,
 }
@@ -67,6 +76,9 @@ struct InterruptStack {
 static GDT_LOADED: AtomicBool = AtomicBool::new(false);
 static mut GDT: [u64; GDT_ENTRY_COUNT] = [0; GDT_ENTRY_COUNT];
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
+static mut PRIVILEGE_STACK: InterruptStack = InterruptStack {
+    bytes: [0; PRIVILEGE_STACK_SIZE],
+};
 static mut DOUBLE_FAULT_STACK: InterruptStack = InterruptStack {
     bytes: [0; DOUBLE_FAULT_STACK_SIZE],
 };
@@ -78,6 +90,7 @@ pub fn init() -> Snapshot {
 
     unsafe {
         let tss = core::ptr::addr_of_mut!(TSS);
+        (*tss).privilege_stack_table[0] = privilege_stack_top();
         (*tss).interrupt_stack_table[(DOUBLE_FAULT_IST_INDEX - 1) as usize] =
             double_fault_stack_top();
         (*tss).iomap_base = size_of::<TaskStateSegment>() as u16;
@@ -88,6 +101,8 @@ pub fn init() -> Snapshot {
         *gdt.add(2) = KERNEL_DATA_DESCRIPTOR;
         *gdt.add(3) = tss_low;
         *gdt.add(4) = tss_high;
+        *gdt.add(5) = USER_DATA_DESCRIPTOR;
+        *gdt.add(6) = USER_CODE_DESCRIPTOR;
 
         load_gdt();
         load_data_segments();
@@ -104,11 +119,15 @@ pub fn snapshot() -> Snapshot {
         code_selector: KERNEL_CODE_SELECTOR,
         data_selector: KERNEL_DATA_SELECTOR,
         tss_selector: TSS_SELECTOR,
+        user_code_selector: USER_CODE_SELECTOR,
+        user_data_selector: USER_DATA_SELECTOR,
         double_fault_ist_index: DOUBLE_FAULT_IST_INDEX,
         gdt_base: gdt_base(),
         gdt_limit: gdt_limit(),
         tss_base: tss_base(),
         tss_limit: (size_of::<TaskStateSegment>() - 1) as u16,
+        privilege_stack_top: privilege_stack_top(),
+        privilege_stack_bytes: PRIVILEGE_STACK_SIZE as u64,
         double_fault_stack_top: double_fault_stack_top(),
         double_fault_stack_bytes: DOUBLE_FAULT_STACK_SIZE as u64,
     }
@@ -178,6 +197,10 @@ fn gdt_limit() -> u16 {
 
 fn tss_base() -> u64 {
     unsafe { core::ptr::addr_of!(TSS) as u64 }
+}
+
+fn privilege_stack_top() -> u64 {
+    unsafe { core::ptr::addr_of!(PRIVILEGE_STACK) as u64 + PRIVILEGE_STACK_SIZE as u64 }
 }
 
 fn double_fault_stack_top() -> u64 {
