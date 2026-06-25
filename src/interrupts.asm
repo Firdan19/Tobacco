@@ -110,13 +110,13 @@ keyboard_interrupt_stub:
     call_rust_handler keyboard_interrupt_handler
 
 syscall_interrupt_stub:
+    push_regs
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
     mov fs, ax
     mov gs, ax
-    push_regs
     mov rdi, rsp
     mov rax, rsp
     and rsp, -16
@@ -125,12 +125,12 @@ syscall_interrupt_stub:
     cld
     call syscall_dispatch_handler
     mov rsp, [rsp]
-    pop_regs
     mov ax, 0x2b
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
+    pop_regs
     iretq
 
 default_irq_stub:
