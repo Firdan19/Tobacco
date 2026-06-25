@@ -108,7 +108,19 @@ pub fn init() -> Snapshot {
     USER_READY.store(code_mapped && stack_mapped, Ordering::Release);
 
     let snapshot = snapshot();
+    let code = paging::translate(paging::USER_PROBE_CODE_PAGE);
+    let stack = paging::translate(paging::USER_PROBE_STACK_PAGE);
     serial::log_bool("user", "ring3 pages", snapshot.initialized);
+    serial::log_bool(
+        "user",
+        "code user page",
+        code.mapped && code.user_accessible,
+    );
+    serial::log_bool(
+        "user",
+        "stack user page",
+        stack.mapped && stack.user_accessible,
+    );
     serial::log_hex_u64("user", "code virt", snapshot.code_virtual);
     serial::log_hex_u64("user", "stack top", snapshot.stack_top);
 

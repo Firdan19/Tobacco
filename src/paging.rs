@@ -15,7 +15,9 @@ pub const KERNEL_HEAP_BASE: u64 = KERNEL_HEAP_GUARD_LOW + PAGE_SIZE_4K;
 pub const KERNEL_HEAP_SIZE: u64 = 64 * 1024;
 pub const KERNEL_HEAP_GUARD_HIGH: u64 = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE;
 pub const KERNEL_VM_TEST_PAGE: u64 = KERNEL_VIRTUAL_BASE + 0x0200_0000;
-pub const USER_SPACE_BASE: u64 = KERNEL_VIRTUAL_BASE + 0x0300_0000;
+pub const USER_SPACE_BASE: u64 = BOOT_IDENTITY_MAP_BYTES;
+pub const USER_SPACE_SIZE: u64 = 16 * 1024 * 1024;
+pub const USER_SPACE_END: u64 = USER_SPACE_BASE + USER_SPACE_SIZE;
 pub const USER_PROBE_CODE_PAGE: u64 = USER_SPACE_BASE;
 pub const USER_PROBE_STACK_PAGE: u64 = USER_SPACE_BASE + PAGE_SIZE_4K;
 pub const USER_PROBE_STACK_TOP: u64 = USER_PROBE_STACK_PAGE + PAGE_SIZE_4K;
@@ -295,6 +297,10 @@ pub fn probe_map_unmap(virt: u64) -> bool {
 pub fn fault_policy(address: u64, _error_code: u64) -> &'static str {
     if in_page(address, KERNEL_HEAP_GUARD_LOW) || in_page(address, KERNEL_HEAP_GUARD_HIGH) {
         "heap guard page violation"
+    } else if in_user_virtual_range(address) && !translate(address).mapped {
+        "user virtual address not mapped"
+    } else if in_user_virtual_range(address) {
+        "user virtual address protection fault"
     } else if in_managed_virtual_range(address) && !translate(address).mapped {
         "managed virtual address not mapped"
     } else if in_managed_virtual_range(address) {
@@ -404,7 +410,7 @@ fn map_page_inner_with_flags(virt: u64, phys: u64, flags: u64) -> Result<(), Map
         return Err(MapError::PhysicalUnaligned);
     }
 
-    if !in_managed_virtual_range(virt) {
+    if !in_mappable_virtual_range(virt, flags) {
         return Err(MapError::OutsideManagedRange);
     }
 
@@ -540,6 +546,18 @@ fn zero_frame(phys: u64) {
 
 fn in_managed_virtual_range(virt: u64) -> bool {
     virt >= KERNEL_VIRTUAL_BASE && virt < KERNEL_VIRTUAL_END
+}
+
+fn in_user_virtual_range(virt: u64) -> bool {
+    (USER_SPACE_BASE..USER_SPACE_END).contains(&virt)
+}
+
+fn in_mappable_virtual_range(virt: u64, flags: u64) -> bool {
+    if flags & ENTRY_USER != 0 {
+        in_user_virtual_range(virt)
+    } else {
+        in_managed_virtual_range(virt)
+    }
 }
 
 fn identity_reachable(phys: u64) -> bool {
