@@ -195,14 +195,14 @@ pub fn run_probe() -> ProbeResult {
 }
 
 #[no_mangle]
-pub extern "C" fn syscall_dispatch_handler(frame: *mut SyscallFrame) {
+pub extern "C" fn syscall_dispatch_handler(number: u64, arg0: u64, frame: *mut SyscallFrame) {
     let frame = unsafe { &mut *frame };
     USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
     stats::inc_syscall();
 
-    match frame.rax {
+    match number {
         SYSCALL_LOG => {
-            serial::log_u64("syscall", "user log id", frame.rdi);
+            serial::log_u64("syscall", "user log id", arg0);
             frame.rax = 0;
         }
         SYSCALL_UPTIME => {
@@ -212,13 +212,13 @@ pub extern "C" fn syscall_dispatch_handler(frame: *mut SyscallFrame) {
             frame.rax = ticks;
         }
         SYSCALL_EXIT => {
-            serial::log_u64("syscall", "exit", frame.rdi);
+            serial::log_u64("syscall", "exit", arg0);
             unsafe {
-                user_return_to_kernel(frame.rdi);
+                user_return_to_kernel(arg0);
             }
         }
-        number => {
-            serial::log_u64("syscall", "unknown syscall", number);
+        unknown => {
+            serial::log_u64("syscall", "unknown syscall", unknown);
             frame.rax = u64::MAX;
         }
     }

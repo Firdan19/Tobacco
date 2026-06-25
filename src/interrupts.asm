@@ -111,13 +111,15 @@ keyboard_interrupt_stub:
 
 syscall_interrupt_stub:
     push_regs
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov fs, ax
-    mov gs, ax
-    mov rdi, rsp
+    mov r10w, 0x10
+    mov ds, r10w
+    mov es, r10w
+    mov ss, r10w
+    mov fs, r10w
+    mov gs, r10w
+    mov rdx, rsp
+    mov rdi, [rsp + 112]
+    mov rsi, [rsp + 72]
     mov rax, rsp
     and rsp, -16
     sub rsp, 16
@@ -125,11 +127,11 @@ syscall_interrupt_stub:
     cld
     call syscall_dispatch_handler
     mov rsp, [rsp]
-    mov ax, 0x2b
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
+    mov r10w, 0x2b
+    mov ds, r10w
+    mov es, r10w
+    mov fs, r10w
+    mov gs, r10w
     pop_regs
     iretq
 
