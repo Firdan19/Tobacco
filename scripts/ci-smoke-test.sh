@@ -48,6 +48,11 @@ assert_log() {
 }
 
 assert_log "[boot] Tobacco v0.0.5 booting..."
+assert_log "[build] git commit:"
+assert_log "[build] build time:"
+assert_log "[build] profile: release"
+assert_log "[build] target: x86_64-unknown-none.json"
+assert_log "[build] feature flags: none"
 assert_log "[klog] ring buffer ready"
 assert_log "[gdt] gdt, tss, ist ready"
 assert_log "[gdt] tss base:"

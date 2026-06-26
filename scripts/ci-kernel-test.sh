@@ -72,6 +72,11 @@ assert_boot_baseline() {
     serial_log="$1"
 
     assert_log "$serial_log" "[boot] Tobacco v0.0.5 booting..."
+    assert_log "$serial_log" "[build] git commit:"
+    assert_log "$serial_log" "[build] build time:"
+    assert_log "$serial_log" "[build] profile: release"
+    assert_log "$serial_log" "[build] target: x86_64-unknown-none.json"
+    assert_log "$serial_log" "[build] feature flags: none"
     assert_log "$serial_log" "[klog] ring buffer ready"
     assert_log "$serial_log" "[gdt] gdt, tss, ist ready"
     assert_log "$serial_log" "[boot] multiboot magic: on"

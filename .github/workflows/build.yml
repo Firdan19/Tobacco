@@ -23,7 +23,17 @@ jobs:
         run: |
           mkdir -p target
           nasm -f elf64 src/interrupts.asm -o target/interrupts.o
-      - run: RUSTFLAGS="-C link-arg=-Tlinker.ld -C link-arg=$PWD/target/interrupts.o" cargo build --release --target x86_64-unknown-none.json -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Zjson-target-spec
+      - name: Build release kernel
+        env:
+          TOBACCO_GIT_COMMIT: ${{ github.sha }}
+          TOBACCO_BUILD_PROFILE: release
+          TOBACCO_BUILD_TARGET: x86_64-unknown-none.json
+          TOBACCO_BUILD_FEATURES: none
+          TOBACCO_BUILD_TOOLCHAIN: nightly
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export TOBACCO_BUILD_TIME="$(date -u -d "@${SOURCE_DATE_EPOCH}" "+%Y-%m-%dT%H:%M:%SZ")"
+          RUSTFLAGS="-C link-arg=-Tlinker.ld -C link-arg=$PWD/target/interrupts.o" cargo build --release --target x86_64-unknown-none.json -Z build-std=core,compiler_builtins -Z build-std-features=compiler-builtins-mem -Zjson-target-spec
       - name: Prepare ISO root
         run: |
           mkdir -p iso/boot/grub

@@ -5,6 +5,7 @@ use core::panic::PanicInfo;
 use x86_64::instructions::hlt;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
+mod buildinfo;
 mod ci;
 mod gdt;
 mod heap;
@@ -148,6 +149,15 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info_addr: u32) ->
     klog::init();
     serial::log("klog", "ring buffer ready");
     serial::log("boot", "Tobacco v0.0.5 booting...");
+    serial::log_bytes("build", "git commit", buildinfo::GIT_COMMIT.as_bytes());
+    serial::log_bytes("build", "build time", buildinfo::BUILD_TIME.as_bytes());
+    serial::log_bytes("build", "profile", buildinfo::BUILD_PROFILE.as_bytes());
+    serial::log_bytes("build", "target", buildinfo::BUILD_TARGET.as_bytes());
+    serial::log_bytes(
+        "build",
+        "feature flags",
+        buildinfo::FEATURE_FLAGS.as_bytes(),
+    );
     let gdt_state = gdt::init();
     serial::log("gdt", "gdt, tss, ist ready");
     serial::log_hex_u64("gdt", "gdt base", gdt_state.gdt_base);

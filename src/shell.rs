@@ -1,7 +1,7 @@
 use crate::keyboard::{self, KeyEvent};
 use crate::{
-    gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, scheduler, serial, stats,
-    vga,
+    buildinfo, gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, scheduler,
+    serial, stats, vga,
 };
 use crate::{process, syscall, user};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -755,25 +755,32 @@ fn command_buildinfo(_arguments: &[u8]) {
     serial::log("build", "buildinfo requested");
 
     println("Build info:");
-    println("  name      : Tobacco");
+    print("  name      : ");
+    println(buildinfo::OS_NAME);
     print("  package   : ");
-    println(env!("CARGO_PKG_NAME"));
+    println(buildinfo::PACKAGE_NAME);
     print("  version   : ");
-    println(env!("CARGO_PKG_VERSION"));
-    println("  edition   : Rust 2021");
-    println("  target    : x86_64-unknown-none");
-    println("  boot      : GRUB Multiboot2 ISO");
-    println("  mode      : no_std / no_main");
+    println(buildinfo::PACKAGE_VERSION);
+    print("  git commit: ");
+    println(buildinfo::GIT_COMMIT);
+    print("  build time: ");
+    println(buildinfo::BUILD_TIME);
     print("  profile   : ");
-    if cfg!(debug_assertions) {
-        println("debug");
-    } else {
-        println("release");
-    }
-    print("  git sha   : ");
-    println(option_env!("GITHUB_SHA").unwrap_or("local"));
-    print("  workflow  : ");
-    println(option_env!("GITHUB_WORKFLOW").unwrap_or("local"));
+    println(buildinfo::BUILD_PROFILE);
+    print("  target    : ");
+    println(buildinfo::BUILD_TARGET);
+    print("  features  : ");
+    println(buildinfo::FEATURE_FLAGS);
+    print("  toolchain : ");
+    println(buildinfo::TOOLCHAIN);
+    print("  edition   : Rust ");
+    println(buildinfo::RUST_EDITION);
+    print("  boot      : ");
+    println(buildinfo::BOOT_PROTOCOL);
+    print("  mode      : ");
+    println(buildinfo::KERNEL_MODE);
+    print("  reproducible: ");
+    println(buildinfo::REPRODUCIBILITY);
 }
 
 fn command_health(_arguments: &[u8]) {
@@ -813,9 +820,9 @@ fn command_diag(_arguments: &[u8]) {
     print_duration(interrupts::ticks() / PIT_HZ);
     newline();
     print("  build        : ");
-    print(env!("CARGO_PKG_VERSION"));
+    print(buildinfo::PACKAGE_VERSION);
     print(" / ");
-    println(option_env!("GITHUB_SHA").unwrap_or("local"));
+    println(buildinfo::GIT_COMMIT);
     print("  boot parsed  : ");
     print_on_off(boot_info.parsed);
     newline();
