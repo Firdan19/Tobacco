@@ -1,6 +1,6 @@
 use crate::{
-    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, process, serial, shell,
-    stats, user, vga,
+    gdt, heap, interrupts, keyboard, klog, multiboot, paging, physmem, process, scheduler, serial,
+    shell, stats, user, vga,
 };
 use x86_64::instructions::hlt;
 
@@ -104,6 +104,7 @@ fn run_command_table_checks() {
     check("command vmtest", shell::command_exists(b"vmtest"));
     check("command user", shell::command_exists(b"user"));
     check("command process", shell::command_exists(b"process"));
+    check("command sched", shell::command_exists(b"sched"));
     check("command usertest", shell::command_exists(b"usertest"));
     check("command tasktest", shell::command_exists(b"tasktest"));
     check("command syscall", shell::command_exists(b"syscall"));
@@ -126,6 +127,7 @@ fn run_selftest_checks() -> bool {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let process_state = process::snapshot();
+    let scheduler_state = scheduler::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -242,6 +244,13 @@ fn run_selftest_checks() -> bool {
     );
     ok &= check("selftest process model", process::selftest());
     ok &= check(
+        "selftest scheduler ready",
+        scheduler_state.initialized
+            && scheduler_state.queue_capacity == scheduler::QUEUE_CAPACITY as u64
+            && scheduler_state.queued_tasks <= scheduler_state.queue_capacity,
+    );
+    ok &= check("selftest scheduler model", scheduler::selftest());
+    ok &= check(
         "selftest kernel log ready",
         log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
     );
@@ -255,7 +264,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 38);
+    ok &= check("selftest command table sane", shell::command_count() >= 40);
 
     ok
 }
@@ -282,7 +291,7 @@ fn run_user_mode_checks() -> bool {
     );
     ok &= check(
         "user probe syscalls",
-        result.syscalls_after >= result.syscalls_before + 3,
+        result.syscalls_after >= result.syscalls_before + 4,
     );
     ok &= check("user probe passed", result.passed);
     ok &= check("user pass counter", after.pass_count > before.pass_count);
@@ -292,6 +301,13 @@ fn run_user_mode_checks() -> bool {
             && process_after.exited_total > process_before.exited_total
             && process_after.last_task_id == result.task_id
             && process_after.last_exit_code == result.exit_code,
+    );
+    let scheduler_after = scheduler::snapshot();
+    ok &= check(
+        "user scheduler accounting",
+        scheduler_after.context_switches > 0
+            && scheduler_after.cooperative_yields > 0
+            && scheduler_after.last_task == result.task_id,
     );
 
     ok

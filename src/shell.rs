@@ -1,6 +1,7 @@
 use crate::keyboard::{self, KeyEvent};
 use crate::{
-    gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, serial, stats, vga,
+    gdt, heap, interrupts, klog, multiboot, paging, paniclog, physmem, scheduler, serial, stats,
+    vga,
 };
 use crate::{process, user};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -19,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 38] = [
+const COMMANDS: [Command; 40] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -139,6 +140,16 @@ const COMMANDS: [Command; 38] = [
         name: "process",
         description: "status task dan process model",
         handler: command_process,
+    },
+    Command {
+        name: "sched",
+        description: "status scheduler minimal",
+        handler: command_scheduler,
+    },
+    Command {
+        name: "scheduler",
+        description: "alias untuk sched",
+        handler: command_scheduler,
     },
     Command {
         name: "usertest",
@@ -755,6 +766,7 @@ fn command_diag(_arguments: &[u8]) {
     let gdt_state = gdt::snapshot();
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
+    let scheduler_state = scheduler::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -796,6 +808,8 @@ fn command_diag(_arguments: &[u8]) {
     print_counter("syscall vector", interrupt_abi.syscall_vector);
     print_counter("tasks spawned", process_state.spawned_tasks);
     print_counter("tasks exited", process_state.exited_total);
+    print_counter("ctx switches", scheduler_state.context_switches);
+    print_counter("task ticks", scheduler_state.accounted_ticks);
     print("  user mode    : ");
     print_on_off(user_state.initialized && user_state.syscall_gate_ready);
     newline();
@@ -856,6 +870,7 @@ fn print_health_report() -> u64 {
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
+    let scheduler_state = scheduler::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
@@ -940,6 +955,11 @@ fn print_health_report() -> u64 {
         &mut issues,
     );
     health_line(
+        "scheduler",
+        scheduler_state.initialized && scheduler_state.current_task == 0 && scheduler::selftest(),
+        &mut issues,
+    );
+    health_line(
         "kernel log",
         log.initialized && log.count <= log.capacity,
         &mut issues,
@@ -955,7 +975,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 38, &mut issues);
+    health_line("command table", COMMANDS.len() >= 40, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -973,6 +993,7 @@ fn health_issue_count() -> u64 {
     let ticks = interrupts::ticks();
     let panic = paniclog::snapshot();
     let process_state = process::snapshot();
+    let scheduler_state = scheduler::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
     let mut issues = 0u64;
@@ -1040,6 +1061,10 @@ fn health_issue_count() -> u64 {
         process_state.initialized && process_state.running_tasks == 0 && process::selftest(),
         &mut issues,
     );
+    count_issue(
+        scheduler_state.initialized && scheduler_state.current_task == 0 && scheduler::selftest(),
+        &mut issues,
+    );
     count_issue(log.initialized && log.count <= log.capacity, &mut issues);
     count_issue(
         counters.serial_bytes > 0 && counters.vga_cell_writes > 0,
@@ -1047,7 +1072,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 38, &mut issues);
+    count_issue(COMMANDS.len() >= 40, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1533,6 +1558,7 @@ fn command_usertest(_arguments: &[u8]) {
 
 fn command_process(_arguments: &[u8]) {
     let snapshot = process::snapshot();
+    let scheduler_snapshot = scheduler::snapshot();
 
     println("Process model:");
     print("  initialized      : ");
@@ -1549,6 +1575,9 @@ fn command_process(_arguments: &[u8]) {
     print_counter("failed spawns", snapshot.failed_spawns);
     print_counter("last task", snapshot.last_task_id);
     print_counter("last exit", snapshot.last_exit_code);
+    print_counter("ctx switches", scheduler_snapshot.context_switches);
+    print_counter("yield calls", scheduler_snapshot.cooperative_yields);
+    print_counter("task ticks", scheduler_snapshot.accounted_ticks);
 
     println("Tasks:");
     for index in 0..process::MAX_TASKS {
@@ -1570,6 +1599,25 @@ fn command_process(_arguments: &[u8]) {
     }
 }
 
+fn command_scheduler(_arguments: &[u8]) {
+    let snapshot = scheduler::snapshot();
+
+    println("Scheduler:");
+    print("  initialized      : ");
+    print_on_off(snapshot.initialized);
+    newline();
+    print_counter("queue capacity", snapshot.queue_capacity);
+    print_counter("queued tasks", snapshot.queued_tasks);
+    print_counter("current task", snapshot.current_task);
+    print_counter("last task", snapshot.last_task);
+    print_counter("ctx switches", snapshot.context_switches);
+    print_counter("yields", snapshot.cooperative_yields);
+    print_counter("timer ticks", snapshot.timer_ticks);
+    print_counter("task ticks", snapshot.accounted_ticks);
+    print_counter("failed enqueue", snapshot.failed_enqueues);
+    print_counter("last switch", snapshot.last_switch_tick);
+}
+
 fn command_syscall(_arguments: &[u8]) {
     println("Syscall ABI:");
     println("  gate      : int 0x80");
@@ -1579,6 +1627,7 @@ fn command_syscall(_arguments: &[u8]) {
     println("  1 log     : rdi = message id");
     println("  2 uptime  : return timer ticks");
     println("  3 exit    : rdi = exit code");
+    println("  4 yield   : cooperative scheduler yield");
 }
 
 fn command_gdt(_arguments: &[u8]) {
@@ -1862,6 +1911,7 @@ fn command_selftest(_arguments: &[u8]) {
     let counters = stats::snapshot();
     let ticks = interrupts::ticks();
     let process_state = process::snapshot();
+    let scheduler_state = scheduler::snapshot();
     let user_state = user::snapshot();
     let interrupt_abi = interrupts::abi_snapshot();
 
@@ -2030,6 +2080,20 @@ fn command_selftest(_arguments: &[u8]) {
         &mut failed,
     );
     selftest_check(
+        "scheduler ready",
+        scheduler_state.initialized
+            && scheduler_state.queue_capacity == scheduler::QUEUE_CAPACITY as u64
+            && scheduler_state.queued_tasks <= scheduler_state.queue_capacity,
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
+        "scheduler selftest",
+        scheduler::selftest(),
+        &mut passed,
+        &mut failed,
+    );
+    selftest_check(
         "kernel log ring ready",
         log.initialized && log.capacity == klog::ENTRY_COUNT as u64 && log.count > 0,
         &mut passed,
@@ -2061,7 +2125,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 38,
+        COMMANDS.len() >= 40,
         &mut passed,
         &mut failed,
     );

@@ -1,5 +1,5 @@
 use crate::keyboard::KeyEvent;
-use crate::{gdt, keyboard, paging, paniclog, serial, stats, vga};
+use crate::{gdt, keyboard, paging, paniclog, scheduler, serial, stats, vga};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts as cpu_interrupts;
@@ -320,6 +320,7 @@ unsafe fn send_eoi(irq: u8) {
 pub extern "C" fn timer_interrupt_handler() {
     stats::inc_timer_irq();
     PIT_TICKS.fetch_add(1, Ordering::Relaxed);
+    scheduler::on_timer_tick();
     vga::toggle_cursor();
 
     unsafe {

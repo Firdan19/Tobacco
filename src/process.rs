@@ -1,4 +1,4 @@
-use crate::{serial, user};
+use crate::{scheduler, serial, user};
 use core::cell::UnsafeCell;
 use x86_64::instructions::interrupts as cpu_interrupts;
 
@@ -172,6 +172,7 @@ impl ProcessTable {
         self.spawned_tasks = self.spawned_tasks.saturating_add(1);
         self.last_task_id = id;
         serial::log_u64("process", "task ready", id);
+        scheduler::enqueue_task(id);
 
         Some(task)
     }
@@ -186,6 +187,7 @@ impl ProcessTable {
         self.tasks[index].runs = self.tasks[index].runs.saturating_add(1);
         self.last_task_id = id;
         serial::log_u64("process", "task running", id);
+        scheduler::begin_task(id);
 
         true
     }
@@ -201,6 +203,7 @@ impl ProcessTable {
         self.last_exit_code = exit_code;
         serial::log_u64("process", "task exited", id);
         serial::log_u64("process", "exit code", exit_code);
+        scheduler::finish_task(id);
 
         Some(self.tasks[index])
     }
@@ -346,6 +349,7 @@ pub fn selftest() -> bool {
         && snapshot.task_capacity == MAX_TASKS as u64
         && snapshot.running_tasks == 0
         && snapshot.next_task_id >= 1
+        && scheduler::selftest()
         && user::probe_entry_point() != 0
         && user::probe_stack_top() != 0
         && user::probe_expected_exit_code() == 42
