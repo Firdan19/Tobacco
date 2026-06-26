@@ -98,8 +98,10 @@ fn run_shell_command_smoke() {
     run_command_table_checks();
 
     if run_console_stress_checks() {
+        serial::log("ci", "console status: PASS");
         serial::log("ci", "shell command smoke status: PASS");
     } else {
+        serial::log("ci", "console status: FAIL");
         serial::log("ci", "shell command smoke status: FAIL");
     }
 
