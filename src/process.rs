@@ -631,6 +631,7 @@ fn run_spawned_task(
 
     if task.address_space_root != 0 {
         serial::log("process", "entering isolated user address space");
+        serial::log("elf", "entering ELF64 user entry point");
     }
     let user_result = if task.address_space_root == 0 {
         user::run_program(
@@ -661,6 +662,13 @@ fn run_spawned_task(
     .unwrap_or(task);
     let passed =
         user_result.passed && exited && final_task.state == TaskState::Exited && resources_cleaned;
+    if task.address_space_root != 0 {
+        if passed {
+            serial::log("elf", "ELF64 user process passed");
+        } else {
+            serial::log("elf", "ELF64 user process failed");
+        }
+    }
 
     TaskRunResult {
         ran: user_result.ran,
