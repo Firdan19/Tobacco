@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 54] = [
+const COMMANDS: [Command; 56] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -180,6 +180,16 @@ const COMMANDS: [Command; 54] = [
         name: "lifecycletest",
         description: "uji isolasi dan cleanup dua process",
         handler: command_lifecycletest,
+    },
+    Command {
+        name: "proctree",
+        description: "tampilkan relasi parent dan child",
+        handler: command_process_tree,
+    },
+    Command {
+        name: "waittest",
+        description: "uji wait, wakeup, dan reaping child",
+        handler: command_waittest,
     },
     Command {
         name: "tasks",
@@ -1095,6 +1105,8 @@ fn print_health_report() -> u64 {
         "process model",
         process_state.initialized
             && process_state.running_tasks == 0
+            && process_state.blocked_tasks == 0
+            && process_state.zombie_children == 0
             && process_state.active_resources == 0
             && process_state.cleanup_failures == 0
             && process::selftest(),
@@ -1131,7 +1143,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 54, &mut issues);
+    health_line("command table", COMMANDS.len() >= 56, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1226,6 +1238,8 @@ fn health_issue_count() -> u64 {
     count_issue(
         process_state.initialized
             && process_state.running_tasks == 0
+            && process_state.blocked_tasks == 0
+            && process_state.zombie_children == 0
             && process_state.active_resources == 0
             && process_state.cleanup_failures == 0
             && process::selftest(),
@@ -1250,7 +1264,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 54, &mut issues);
+    count_issue(COMMANDS.len() >= 56, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -1951,7 +1965,9 @@ fn command_process(_arguments: &[u8]) {
     print_counter("slots used", snapshot.task_slots_used);
     print_counter("ready", snapshot.ready_tasks);
     print_counter("running", snapshot.running_tasks);
+    print_counter("blocked", snapshot.blocked_tasks);
     print_counter("exited", snapshot.exited_tasks);
+    print_counter("zombie child", snapshot.zombie_children);
     print_counter("next task id", snapshot.next_task_id);
     print_counter("spawned total", snapshot.spawned_tasks);
     print_counter("exited total", snapshot.exited_total);
@@ -1971,6 +1987,9 @@ fn command_process(_arguments: &[u8]) {
     print_counter("timer preempts", scheduler_snapshot.timer_preemptions);
     print_counter("preempt tests", snapshot.preemption_runs);
     print_counter("preempt passes", snapshot.preemption_passes);
+    print_counter("reaped total", snapshot.reaped_total);
+    print_counter("wait blocks", snapshot.wait_blocks);
+    print_counter("parent wakeups", snapshot.parent_wakeups);
 
     print_task_rows();
 }
@@ -1987,6 +2006,11 @@ fn command_lifecycle(_arguments: &[u8]) {
     print_counter("active resources", processes.active_resources);
     print_counter("cleanup success", processes.cleanup_successes);
     print_counter("cleanup failure", processes.cleanup_failures);
+    print_counter("blocked", processes.blocked_tasks);
+    print_counter("zombie child", processes.zombie_children);
+    print_counter("reaped", processes.reaped_total);
+    print_counter("wait blocks", processes.wait_blocks);
+    print_counter("parent wakeups", processes.parent_wakeups);
     print_counter("user frames freed", processes.reclaimed_user_frames);
     print_counter("table frames freed", processes.reclaimed_table_frames);
     print_counter("heap releases", processes.heap_releases);
@@ -1997,6 +2021,8 @@ fn command_lifecycle(_arguments: &[u8]) {
     print_counter("heap allocations", heap_state.active_allocations);
     print("  status           : ");
     if processes.active_resources == 0
+        && processes.blocked_tasks == 0
+        && processes.zombie_children == 0
         && processes.cleanup_failures == 0
         && address_spaces.active == 0
         && address_spaces.cleanup_failures == 0
@@ -2046,6 +2072,65 @@ fn command_lifecycletest(_arguments: &[u8]) {
     }
 }
 
+fn command_process_tree(_arguments: &[u8]) {
+    let snapshot = process::snapshot();
+
+    println("Process tree:");
+    print_counter("tasks", snapshot.task_slots_used);
+    print_counter("blocked", snapshot.blocked_tasks);
+    print_counter("zombie child", snapshot.zombie_children);
+    print_counter("reaped total", snapshot.reaped_total);
+    print_counter("wait blocks", snapshot.wait_blocks);
+    print_counter("parent wakeups", snapshot.parent_wakeups);
+    print_task_rows();
+}
+
+fn command_waittest(_arguments: &[u8]) {
+    println("Process tree wait/reap test:");
+    let report = process::run_process_tree_test();
+
+    print_counter("parent task", report.parent_id);
+    print_counter("child task", report.child_id);
+    print("  relation         : ");
+    print_on_off(report.relation_registered);
+    newline();
+    print("  parent blocked   : ");
+    print_on_off(report.parent_blocked);
+    newline();
+    print("  child exited     : ");
+    print_on_off(report.child_exited);
+    newline();
+    print("  parent woken     : ");
+    print_on_off(report.parent_woken);
+    newline();
+    print("  child reaped     : ");
+    print_on_off(report.child_reaped);
+    newline();
+    print_counter("child exit code", report.child_exit_code);
+    print("  parent completed : ");
+    print_on_off(report.parent_completed);
+    newline();
+    print("  user ptr audit   : ");
+    print_on_off(report.user_buffer_validation);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frames_restored);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_restored);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
 fn command_tasks(_arguments: &[u8]) {
     let snapshot = process::snapshot();
     let scheduler_snapshot = scheduler::snapshot();
@@ -2056,7 +2141,9 @@ fn command_tasks(_arguments: &[u8]) {
     print_counter("used", snapshot.task_slots_used);
     print_counter("ready", snapshot.ready_tasks);
     print_counter("running", snapshot.running_tasks);
+    print_counter("blocked", snapshot.blocked_tasks);
     print_counter("exited", snapshot.exited_tasks);
+    print_counter("zombie child", snapshot.zombie_children);
     print_counter("current", scheduler_snapshot.current_task);
     print_counter("last", scheduler_snapshot.last_task);
     print_task_rows();
@@ -2068,6 +2155,8 @@ fn print_task_rows() {
         if let Some(task) = process::task(index) {
             print("  #");
             print_u64(task.id);
+            print(" p=");
+            print_u64(task.parent_id);
             print(" ");
             print(process::state_name(task.state));
             print(" entry=");
@@ -2090,6 +2179,10 @@ fn print_task_rows() {
             print_u64(task.syscalls_after.saturating_sub(task.syscalls_before));
             print(" clean=");
             print_on_off(task.cleanup_complete);
+            if task.wait_target != 0 {
+                print(" wait=");
+                print_u64(task.wait_target);
+            }
             newline();
         }
     }
@@ -2118,6 +2211,10 @@ fn command_scheduler(_arguments: &[u8]) {
     print_counter("rr rotations", snapshot.round_robin_rotations);
     print_counter("starvation guard", snapshot.starvation_preventions);
     print_counter("maximum wait", snapshot.max_wait_ticks);
+    print_counter("blocked tasks", snapshot.blocked_tasks);
+    print_counter("block events", snapshot.block_events);
+    print_counter("wake events", snapshot.wake_events);
+    print_counter("failed wakeups", snapshot.failed_wakeups);
 }
 
 fn command_preempt(_arguments: &[u8]) {
@@ -2730,6 +2827,8 @@ fn command_selftest(_arguments: &[u8]) {
     selftest_check(
         "process resource lifecycle",
         process_state.active_resources == 0
+            && process_state.blocked_tasks == 0
+            && process_state.zombie_children == 0
             && process_state.cleanup_failures == 0
             && address_spaces.active == 0
             && address_spaces.cleanup_failures == 0,
@@ -2794,7 +2893,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 54,
+        COMMANDS.len() >= 56,
         &mut passed,
         &mut failed,
     );

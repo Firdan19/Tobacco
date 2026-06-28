@@ -244,6 +244,28 @@ case "$TEST_SUITE" in
         assert_log "$log_path" "[ci] scheduler preemption complete"
         assert_no_kernel_failure "$log_path"
         ;;
+    process-tree)
+        log_path="serial-process-tree.log"
+        run_qemu "$IMAGE_DIR/tobacco-ci-proctree.iso" "$log_path" "$TIMEOUT_SECONDS"
+        assert_boot_baseline "$log_path"
+        assert_log "$log_path" "[ci] process tree requested"
+        assert_log "$log_path" "[ci] process tree parent spawned"
+        assert_log "$log_path" "[ci] process tree child spawned"
+        assert_log "$log_path" "[ci] process tree parent child relation"
+        assert_log "$log_path" "[ci] process tree parent blocked"
+        assert_log "$log_path" "[ci] process tree child exited"
+        assert_log "$log_path" "[ci] process tree parent woken"
+        assert_log "$log_path" "[ci] process tree child reaped"
+        assert_log "$log_path" "[ci] process tree exit status"
+        assert_log "$log_path" "[ci] process tree user buffer validation"
+        assert_log "$log_path" "[ci] process tree frame baseline"
+        assert_log "$log_path" "[ci] process tree heap baseline"
+        assert_log "$log_path" "[ci] process tree resource baseline"
+        assert_log "$log_path" "[ci] process tree scheduler wakeup"
+        assert_log "$log_path" "[ci] process tree status: PASS"
+        assert_log "$log_path" "[ci] process tree complete"
+        assert_no_kernel_failure "$log_path"
+        ;;
     panic-fault-screen)
         page_log="serial-panic-fault-screen-pagefault.log"
         double_log="serial-panic-fault-screen-doublefault.log"

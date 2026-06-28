@@ -25,6 +25,10 @@ pub struct Snapshot {
     pub round_robin_rotations: u64,
     pub starvation_preventions: u64,
     pub max_wait_ticks: u64,
+    pub blocked_tasks: u64,
+    pub block_events: u64,
+    pub wake_events: u64,
+    pub failed_wakeups: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -66,8 +70,10 @@ impl QueueEntry {
 struct Scheduler {
     initialized: bool,
     queue: [QueueEntry; QUEUE_CAPACITY],
+    blocked: [u64; QUEUE_CAPACITY],
     head: usize,
     len: usize,
+    blocked_len: usize,
     current_task: u64,
     last_task: u64,
     context_switches: u64,
@@ -82,6 +88,9 @@ struct Scheduler {
     round_robin_rotations: u64,
     starvation_preventions: u64,
     max_wait_ticks: u64,
+    block_events: u64,
+    wake_events: u64,
+    failed_wakeups: u64,
 }
 
 impl Scheduler {
@@ -89,8 +98,10 @@ impl Scheduler {
         Self {
             initialized: false,
             queue: [QueueEntry::empty(); QUEUE_CAPACITY],
+            blocked: [0; QUEUE_CAPACITY],
             head: 0,
             len: 0,
+            blocked_len: 0,
             current_task: 0,
             last_task: 0,
             context_switches: 0,
@@ -105,6 +116,9 @@ impl Scheduler {
             round_robin_rotations: 0,
             starvation_preventions: 0,
             max_wait_ticks: 0,
+            block_events: 0,
+            wake_events: 0,
+            failed_wakeups: 0,
         }
     }
 
@@ -143,6 +157,10 @@ impl Scheduler {
             round_robin_rotations: self.round_robin_rotations,
             starvation_preventions: self.starvation_preventions,
             max_wait_ticks: self.max_wait_ticks,
+            blocked_tasks: self.blocked_len as u64,
+            block_events: self.block_events,
+            wake_events: self.wake_events,
+            failed_wakeups: self.failed_wakeups,
         }
     }
 
@@ -180,6 +198,7 @@ impl Scheduler {
 
     fn begin_task(&mut self, task_id: u64) {
         self.remove(task_id);
+        self.remove_blocked(task_id);
         self.current_task = task_id;
         self.last_task = task_id;
         self.context_switches = self.context_switches.saturating_add(1);
@@ -196,6 +215,7 @@ impl Scheduler {
         }
 
         self.remove(task_id);
+        self.remove_blocked(task_id);
         self.last_task = task_id;
         serial::log_u64("sched", "task complete", task_id);
     }
@@ -211,6 +231,58 @@ impl Scheduler {
         self.last_switch_tick = self.timer_ticks;
         serial::log_u64("sched", "cooperative yield", self.current_task);
         self.current_task
+    }
+
+    fn block_task(&mut self, task_id: u64) -> bool {
+        if task_id == 0 {
+            return false;
+        }
+        if self.contains_blocked(task_id) {
+            return true;
+        }
+        if self.blocked_len >= QUEUE_CAPACITY {
+            return false;
+        }
+
+        let known = if self.current_task == task_id {
+            self.current_task = 0;
+            self.slice_ticks = 0;
+            true
+        } else {
+            self.remove(task_id)
+        };
+        if !known {
+            return false;
+        }
+
+        self.blocked[self.blocked_len] = task_id;
+        self.blocked_len += 1;
+        self.block_events = self.block_events.saturating_add(1);
+        true
+    }
+
+    fn wake_task(&mut self, task_id: u64) -> bool {
+        if task_id == 0 {
+            self.failed_wakeups = self.failed_wakeups.saturating_add(1);
+            return false;
+        }
+        if self.current_task == task_id || self.contains(task_id) {
+            return true;
+        }
+        if !self.remove_blocked(task_id) {
+            self.failed_wakeups = self.failed_wakeups.saturating_add(1);
+            return false;
+        }
+
+        if !self.enqueue_at(task_id, self.timer_ticks) {
+            self.blocked[self.blocked_len] = task_id;
+            self.blocked_len += 1;
+            self.failed_wakeups = self.failed_wakeups.saturating_add(1);
+            return false;
+        }
+
+        self.wake_events = self.wake_events.saturating_add(1);
+        true
     }
 
     fn on_timer_tick(&mut self) {
@@ -294,6 +366,8 @@ impl Scheduler {
             && self.len <= QUEUE_CAPACITY
             && self.queue_capacity_consistent()
             && !self.queue_has_duplicates()
+            && !self.blocked_has_duplicates()
+            && !self.queue_blocked_overlap()
             && self.quantum_ticks > 0
             && model_selftest()
     }
@@ -341,6 +415,26 @@ impl Scheduler {
         removed
     }
 
+    fn contains_blocked(&self, task_id: u64) -> bool {
+        self.blocked[..self.blocked_len].contains(&task_id)
+    }
+
+    fn remove_blocked(&mut self, task_id: u64) -> bool {
+        let Some(index) = self.blocked[..self.blocked_len]
+            .iter()
+            .position(|blocked| *blocked == task_id)
+        else {
+            return false;
+        };
+
+        for shift in index..self.blocked_len.saturating_sub(1) {
+            self.blocked[shift] = self.blocked[shift + 1];
+        }
+        self.blocked_len -= 1;
+        self.blocked[self.blocked_len] = 0;
+        true
+    }
+
     fn queue_has_duplicates(&self) -> bool {
         for left in 0..self.len {
             let left_index = (self.head + left) % QUEUE_CAPACITY;
@@ -360,7 +454,33 @@ impl Scheduler {
     }
 
     fn queue_capacity_consistent(&self) -> bool {
-        self.len <= QUEUE_CAPACITY && self.head < QUEUE_CAPACITY
+        self.len <= QUEUE_CAPACITY
+            && self.blocked_len <= QUEUE_CAPACITY
+            && self.head < QUEUE_CAPACITY
+    }
+
+    fn blocked_has_duplicates(&self) -> bool {
+        for left in 0..self.blocked_len {
+            if self.blocked[left] == 0 {
+                return true;
+            }
+            for right in (left + 1)..self.blocked_len {
+                if self.blocked[left] == self.blocked[right] {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn queue_blocked_overlap(&self) -> bool {
+        for offset in 0..self.len {
+            let index = (self.head + offset) % QUEUE_CAPACITY;
+            if self.contains_blocked(self.queue[index].task_id) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -388,6 +508,14 @@ fn model_selftest() -> bool {
     starvation.on_timer_tick();
     let guarded = starvation.preempt_current();
 
+    let mut blocking = Scheduler::new();
+    blocking.initialized = true;
+    let blocking_queued = blocking.enqueue_at(11, 0);
+    let blocked = blocking.block_task(11);
+    let blocked_snapshot = blocking.snapshot();
+    let woke = blocking.wake_task(11);
+    let wake_snapshot = blocking.snapshot();
+
     queued
         && first.switched
         && first.previous_task == 1
@@ -401,6 +529,15 @@ fn model_selftest() -> bool {
         && guarded.next_task == 9
         && guarded.starvation_guard
         && starvation.starvation_preventions == 1
+        && blocking_queued
+        && blocked
+        && blocked_snapshot.blocked_tasks == 1
+        && blocked_snapshot.queued_tasks == 0
+        && woke
+        && wake_snapshot.blocked_tasks == 0
+        && wake_snapshot.queued_tasks == 1
+        && wake_snapshot.block_events == 1
+        && wake_snapshot.wake_events == 1
 }
 
 struct SchedulerStore {
@@ -436,6 +573,14 @@ pub fn finish_task(task_id: u64) {
 
 pub fn yield_current() -> u64 {
     cpu_interrupts::without_interrupts(|| scheduler_mut().yield_current())
+}
+
+pub fn block_task(task_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| scheduler_mut().block_task(task_id))
+}
+
+pub fn wake_task(task_id: u64) -> bool {
+    cpu_interrupts::without_interrupts(|| scheduler_mut().wake_task(task_id))
 }
 
 pub fn on_timer_tick() {

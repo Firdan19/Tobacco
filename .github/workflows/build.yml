@@ -51,7 +51,7 @@ jobs:
         run: grub-mkrescue -o tobacco.iso iso
       - name: Prepare CI kernel test ISOs
         run: |
-          for mode in shell syscall elf userfault heap keyboard preempt pagefault doublefault; do
+          for mode in shell syscall elf userfault heap keyboard preempt proctree pagefault doublefault; do
             mkdir -p "iso-ci-${mode}/boot/grub"
             cp target/x86_64-unknown-none/release/tobacco-kernel "iso-ci-${mode}/boot/tobacco-kernel"
             cp target/initramfs.cpio "iso-ci-${mode}/boot/initramfs.cpio"
@@ -71,6 +71,7 @@ jobs:
             tobacco-ci-heap.iso
             tobacco-ci-keyboard.iso
             tobacco-ci-preempt.iso
+            tobacco-ci-proctree.iso
             tobacco-ci-pagefault.iso
             tobacco-ci-doublefault.iso
           if-no-files-found: ignore
@@ -94,6 +95,7 @@ jobs:
           - heap-stress
           - keyboard-model
           - scheduler-preemption
+          - process-tree
           - panic-fault-screen
     steps:
       - uses: actions/checkout@v4

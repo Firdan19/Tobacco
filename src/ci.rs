@@ -12,6 +12,7 @@ const CI_USER_FAULT_FLAG: &[u8] = b"tobacco.ci=userfault";
 const CI_HEAP_FLAG: &[u8] = b"tobacco.ci=heap";
 const CI_KEYBOARD_FLAG: &[u8] = b"tobacco.ci=keyboard";
 const CI_PREEMPT_FLAG: &[u8] = b"tobacco.ci=preempt";
+const CI_PROCESS_TREE_FLAG: &[u8] = b"tobacco.ci=proctree";
 const CI_PAGE_FAULT_FLAG: &[u8] = b"tobacco.ci=pagefault";
 const CI_DOUBLE_FAULT_FLAG: &[u8] = b"tobacco.ci=doublefault";
 const VGA_BUFFER_ADDRESS: u64 = 0x000b_8000;
@@ -65,6 +66,11 @@ pub fn run_if_requested() {
 
         if contains_bytes(command_line, CI_PREEMPT_FLAG) {
             run_preemption_matrix();
+            return;
+        }
+
+        if contains_bytes(command_line, CI_PROCESS_TREE_FLAG) {
+            run_process_tree_matrix();
             return;
         }
 
@@ -186,6 +192,17 @@ fn run_preemption_matrix() {
     serial::log("ci", "scheduler preemption complete");
 }
 
+fn run_process_tree_matrix() {
+    serial::log("ci", "process tree requested");
+    if run_process_tree_checks() {
+        serial::log("ci", "process tree status: PASS");
+    } else {
+        serial::log("ci", "process tree status: FAIL");
+    }
+
+    serial::log("ci", "process tree complete");
+}
+
 fn trigger_page_fault_for_ci() -> ! {
     let target = paging::KERNEL_HEAP_GUARD_LOW;
     serial::log("ci-fault", "page fault trigger requested");
@@ -242,6 +259,8 @@ fn run_command_table_checks() {
         "command lifecycletest",
         shell::command_exists(b"lifecycletest"),
     );
+    check("command proctree", shell::command_exists(b"proctree"));
+    check("command waittest", shell::command_exists(b"waittest"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command preempt", shell::command_exists(b"preempt"));
@@ -416,6 +435,8 @@ fn run_selftest_checks() -> bool {
     ok &= check(
         "selftest process resource lifecycle",
         process_state.active_resources == 0
+            && process_state.blocked_tasks == 0
+            && process_state.zombie_children == 0
             && process_state.cleanup_failures == 0
             && address_spaces.active == 0
             && address_spaces.cleanup_failures == 0,
@@ -424,7 +445,8 @@ fn run_selftest_checks() -> bool {
         "selftest scheduler ready",
         scheduler_state.initialized
             && scheduler_state.queue_capacity == scheduler::QUEUE_CAPACITY as u64
-            && scheduler_state.queued_tasks <= scheduler_state.queue_capacity,
+            && scheduler_state.queued_tasks <= scheduler_state.queue_capacity
+            && scheduler_state.blocked_tasks <= scheduler_state.queue_capacity,
     );
     ok &= check("selftest scheduler model", scheduler::selftest());
     ok &= check(
@@ -446,7 +468,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 54);
+    ok &= check("selftest command table sane", shell::command_count() >= 56);
 
     ok
 }
@@ -681,6 +703,52 @@ fn run_preemption_checks() -> bool {
     );
     ok &= check("preempt scheduler model", scheduler::selftest());
     ok &= check("preempt status", report.passed);
+    ok
+}
+
+fn run_process_tree_checks() -> bool {
+    let process_before = process::snapshot();
+    let scheduler_before = scheduler::snapshot();
+    let report = process::run_process_tree_test();
+    let process_after = process::snapshot();
+    let scheduler_after = scheduler::snapshot();
+    let mut ok = true;
+
+    ok &= check("process tree parent spawned", report.parent_id > 0);
+    ok &= check("process tree child spawned", report.child_id > 0);
+    ok &= check(
+        "process tree parent child relation",
+        report.relation_registered,
+    );
+    ok &= check("process tree parent blocked", report.parent_blocked);
+    ok &= check("process tree child exited", report.child_exited);
+    ok &= check("process tree parent woken", report.parent_woken);
+    ok &= check("process tree child reaped", report.child_reaped);
+    ok &= check(
+        "process tree exit status",
+        report.child_exit_code == user_program::INIT_EXPECTED_EXIT_CODE,
+    );
+    ok &= check("process tree parent completed", report.parent_completed);
+    ok &= check(
+        "process tree user buffer validation",
+        report.user_buffer_validation,
+    );
+    ok &= check("process tree frame baseline", report.frames_restored);
+    ok &= check("process tree heap baseline", report.heap_restored);
+    ok &= check("process tree resource baseline", report.resources_restored);
+    ok &= check(
+        "process tree wait accounting",
+        process_after.wait_blocks > process_before.wait_blocks
+            && process_after.parent_wakeups > process_before.parent_wakeups
+            && process_after.reaped_total > process_before.reaped_total,
+    );
+    ok &= check(
+        "process tree scheduler wakeup",
+        scheduler_after.block_events > scheduler_before.block_events
+            && scheduler_after.wake_events > scheduler_before.wake_events
+            && scheduler_after.blocked_tasks == scheduler_before.blocked_tasks,
+    );
+    ok &= check("process tree status", report.passed);
     ok
 }
 

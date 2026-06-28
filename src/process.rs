@@ -8,6 +8,7 @@ const TASK_HEAP_ALIGNMENT: u64 = 64;
 const PREEMPT_TEST_SWITCHES: u64 = 8;
 const PREEMPT_TEST_EXIT_CODE: u64 = 0x5052;
 const SPIN_PROGRAM: [u8; 4] = [0xf3, 0x90, 0xeb, 0xfc];
+const MAX_USER_BUFFER_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub enum TimerAction {
@@ -21,12 +22,14 @@ pub enum TaskState {
     Empty,
     Ready,
     Running,
+    Blocked,
     Exited,
 }
 
 #[derive(Clone, Copy)]
 pub struct Task {
     pub id: u64,
+    pub parent_id: u64,
     pub state: TaskState,
     pub entry_point: u64,
     pub stack_top: u64,
@@ -48,12 +51,14 @@ pub struct Task {
     pub scheduled_slices: u64,
     pub last_scheduled_tick: u64,
     pub max_wait_ticks: u64,
+    pub wait_target: u64,
 }
 
 impl Task {
     const fn empty() -> Self {
         Self {
             id: 0,
+            parent_id: 0,
             state: TaskState::Empty,
             entry_point: 0,
             stack_top: 0,
@@ -75,6 +80,7 @@ impl Task {
             scheduled_slices: 0,
             last_scheduled_tick: 0,
             max_wait_ticks: 0,
+            wait_target: 0,
         }
     }
 }
@@ -86,7 +92,9 @@ pub struct Snapshot {
     pub task_slots_used: u64,
     pub ready_tasks: u64,
     pub running_tasks: u64,
+    pub blocked_tasks: u64,
     pub exited_tasks: u64,
+    pub zombie_children: u64,
     pub active_resources: u64,
     pub next_task_id: u64,
     pub spawned_tasks: u64,
@@ -102,6 +110,9 @@ pub struct Snapshot {
     pub preemption_active: bool,
     pub preemption_runs: u64,
     pub preemption_passes: u64,
+    pub reaped_total: u64,
+    pub wait_blocks: u64,
+    pub parent_wakeups: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -182,6 +193,52 @@ pub struct PreemptionReport {
     pub resources_restored: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct WaitResult {
+    pub found: bool,
+    pub blocked: bool,
+    pub reaped: bool,
+    pub child_id: u64,
+    pub exit_code: u64,
+}
+
+impl WaitResult {
+    const fn missing() -> Self {
+        Self {
+            found: false,
+            blocked: false,
+            reaped: false,
+            child_id: 0,
+            exit_code: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ProcessTreeReport {
+    pub parent_id: u64,
+    pub child_id: u64,
+    pub relation_registered: bool,
+    pub parent_blocked: bool,
+    pub parent_woken: bool,
+    pub child_exited: bool,
+    pub child_reaped: bool,
+    pub child_exit_code: u64,
+    pub parent_completed: bool,
+    pub user_buffer_validation: bool,
+    pub frames_restored: bool,
+    pub heap_restored: bool,
+    pub resources_restored: bool,
+    pub passed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct UserBufferValidation {
+    pub valid: bool,
+    pub pages_checked: u64,
+    pub writable: bool,
+}
+
 struct ProcessSlot {
     task: Task,
     address_space: paging::AddressSpace,
@@ -219,6 +276,9 @@ struct ProcessTable {
     preemption_switches: u64,
     preemption_runs: u64,
     preemption_passes: u64,
+    reaped_total: u64,
+    wait_blocks: u64,
+    parent_wakeups: u64,
     slots: [ProcessSlot; MAX_TASKS],
 }
 
@@ -243,6 +303,9 @@ impl ProcessTable {
             preemption_switches: 0,
             preemption_runs: 0,
             preemption_passes: 0,
+            reaped_total: 0,
+            wait_blocks: 0,
+            parent_wakeups: 0,
             slots: [const { ProcessSlot::empty() }; MAX_TASKS],
         }
     }
@@ -262,7 +325,9 @@ impl ProcessTable {
         let mut task_slots_used = 0u64;
         let mut ready_tasks = 0u64;
         let mut running_tasks = 0u64;
+        let mut blocked_tasks = 0u64;
         let mut exited_tasks = 0u64;
+        let mut zombie_children = 0u64;
 
         for slot in self.slots.iter() {
             match slot.task.state {
@@ -275,9 +340,16 @@ impl ProcessTable {
                     task_slots_used = task_slots_used.saturating_add(1);
                     running_tasks = running_tasks.saturating_add(1);
                 }
+                TaskState::Blocked => {
+                    task_slots_used = task_slots_used.saturating_add(1);
+                    blocked_tasks = blocked_tasks.saturating_add(1);
+                }
                 TaskState::Exited => {
                     task_slots_used = task_slots_used.saturating_add(1);
                     exited_tasks = exited_tasks.saturating_add(1);
+                    if slot.task.parent_id != 0 {
+                        zombie_children = zombie_children.saturating_add(1);
+                    }
                 }
             }
         }
@@ -288,7 +360,9 @@ impl ProcessTable {
             task_slots_used,
             ready_tasks,
             running_tasks,
+            blocked_tasks,
             exited_tasks,
+            zombie_children,
             active_resources: self.active_resources,
             next_task_id: self.next_task_id,
             spawned_tasks: self.spawned_tasks,
@@ -304,6 +378,9 @@ impl ProcessTable {
             preemption_active: self.preemption_active,
             preemption_runs: self.preemption_runs,
             preemption_passes: self.preemption_passes,
+            reaped_total: self.reaped_total,
+            wait_blocks: self.wait_blocks,
+            parent_wakeups: self.parent_wakeups,
         }
     }
 
@@ -320,6 +397,7 @@ impl ProcessTable {
         let task = self.install_task(
             entry_point,
             stack_top,
+            0,
             paging::AddressSpace::empty(),
             0,
             0,
@@ -333,6 +411,27 @@ impl ProcessTable {
     }
 
     fn spawn_elf_init(&mut self) -> Option<Task> {
+        self.spawn_elf_child(0)
+    }
+
+    fn spawn_elf_child(&mut self, parent_id: u64) -> Option<Task> {
+        if parent_id != 0 {
+            let valid_parent = self
+                .find_task(parent_id)
+                .map(|index| {
+                    !matches!(
+                        self.slots[index].task.state,
+                        TaskState::Empty | TaskState::Exited
+                    )
+                })
+                .unwrap_or(false);
+            if !valid_parent {
+                self.failed_spawns = self.failed_spawns.saturating_add(1);
+                serial::log_u64("process", "invalid parent task", parent_id);
+                return None;
+            }
+        }
+
         let mut image = match elf::create_process_image() {
             Ok(image) => image,
             Err(error) => {
@@ -355,6 +454,7 @@ impl ProcessTable {
         let task = self.install_task(
             image.entry_point,
             image.stack_top,
+            parent_id,
             image.address_space,
             image.first_user_frame,
             image.mapped_pages,
@@ -405,6 +505,7 @@ impl ProcessTable {
         let task = self.install_task(
             image.entry_point,
             image.stack_top,
+            0,
             image.address_space,
             image.first_user_frame,
             image.mapped_pages,
@@ -422,6 +523,7 @@ impl ProcessTable {
         &mut self,
         entry_point: u64,
         stack_top: u64,
+        parent_id: u64,
         address_space: paging::AddressSpace,
         first_user_frame: u64,
         owned_user_pages: u64,
@@ -444,6 +546,7 @@ impl ProcessTable {
         self.next_task_id = self.next_task_id.saturating_add(1);
         let task = Task {
             id,
+            parent_id,
             state: TaskState::Ready,
             entry_point,
             stack_top,
@@ -465,6 +568,7 @@ impl ProcessTable {
             scheduled_slices: 0,
             last_scheduled_tick: 0,
             max_wait_ticks: 0,
+            wait_target: 0,
         };
 
         self.slots[index] = ProcessSlot {
@@ -477,6 +581,7 @@ impl ProcessTable {
         self.active_resources = self.active_resources.saturating_add(1);
         self.last_task_id = id;
         serial::log_u64("process", "task spawned", id);
+        serial::log_u64("process", "parent task", parent_id);
         serial::log_hex_u64("process", "address space root", task.address_space_root);
         scheduler::enqueue_task(id);
         Some(task)
@@ -504,16 +609,19 @@ impl ProcessTable {
             return false;
         };
 
-        let task = &mut self.slots[index].task;
-        task.state = TaskState::Exited;
-        task.exit_code = exit_code;
-        task.syscalls_after = syscalls_after;
+        let parent_id = self.slots[index].task.parent_id;
+        self.slots[index].task.state = TaskState::Exited;
+        self.slots[index].task.exit_code = exit_code;
+        self.slots[index].task.syscalls_after = syscalls_after;
         self.exited_total = self.exited_total.saturating_add(1);
         self.last_task_id = id;
         self.last_exit_code = exit_code;
         serial::log_u64("process", "task exited", id);
         serial::log_u64("process", "exit code", exit_code);
         scheduler::finish_task(id);
+        if parent_id != 0 {
+            self.wake_waiting_parent(parent_id, id);
+        }
         true
     }
 
@@ -635,11 +743,180 @@ impl ProcessTable {
         TimerAction::Switch(self.slots[next_index].task.address_space_root)
     }
 
+    fn wait_child(&mut self, parent_id: u64, child_id: u64) -> WaitResult {
+        let Some(parent_index) = self.find_task(parent_id) else {
+            return WaitResult::missing();
+        };
+        if matches!(
+            self.slots[parent_index].task.state,
+            TaskState::Empty | TaskState::Exited
+        ) {
+            return WaitResult::missing();
+        }
+
+        let Some(child_index) = self.find_child(parent_id, child_id) else {
+            return WaitResult::missing();
+        };
+        let child = self.slots[child_index].task;
+        if child.state == TaskState::Exited && !child.resources_active && child.cleanup_complete {
+            let result = WaitResult {
+                found: true,
+                blocked: false,
+                reaped: true,
+                child_id: child.id,
+                exit_code: child.exit_code,
+            };
+            self.slots[child_index] = ProcessSlot::empty();
+            self.reaped_total = self.reaped_total.saturating_add(1);
+            serial::log_u64("process", "child reaped", child.id);
+            serial::log_u64("process", "wait exit code", child.exit_code);
+            return result;
+        }
+
+        if child.state != TaskState::Exited && scheduler::block_task(parent_id) {
+            self.slots[parent_index].task.state = TaskState::Blocked;
+            self.slots[parent_index].task.wait_target = child.id;
+            self.wait_blocks = self.wait_blocks.saturating_add(1);
+            serial::log_u64("process", "parent blocked", parent_id);
+            return WaitResult {
+                found: true,
+                blocked: true,
+                reaped: false,
+                child_id: child.id,
+                exit_code: 0,
+            };
+        }
+
+        WaitResult {
+            found: true,
+            blocked: false,
+            reaped: false,
+            child_id: child.id,
+            exit_code: child.exit_code,
+        }
+    }
+
+    fn wake_waiting_parent(&mut self, parent_id: u64, child_id: u64) -> bool {
+        let Some(parent_index) = self.find_task(parent_id) else {
+            return false;
+        };
+        let parent = self.slots[parent_index].task;
+        if parent.state != TaskState::Blocked
+            || (parent.wait_target != 0 && parent.wait_target != child_id)
+        {
+            return false;
+        }
+        if !scheduler::wake_task(parent_id) {
+            return false;
+        }
+
+        self.slots[parent_index].task.state = TaskState::Ready;
+        self.slots[parent_index].task.wait_target = 0;
+        self.parent_wakeups = self.parent_wakeups.saturating_add(1);
+        serial::log_u64("process", "parent woken", parent_id);
+        true
+    }
+
+    fn find_child(&self, parent_id: u64, child_id: u64) -> Option<usize> {
+        let mut first_match = None;
+        for index in 0..MAX_TASKS {
+            let task = self.slots[index].task;
+            if task.state == TaskState::Empty
+                || task.parent_id != parent_id
+                || (child_id != 0 && task.id != child_id)
+            {
+                continue;
+            }
+            if task.state == TaskState::Exited && !task.resources_active {
+                return Some(index);
+            }
+            if first_match.is_none() {
+                first_match = Some(index);
+            }
+        }
+        first_match
+    }
+
+    fn child_count(&self, parent_id: u64) -> u64 {
+        self.slots
+            .iter()
+            .filter(|slot| slot.task.state != TaskState::Empty && slot.task.parent_id == parent_id)
+            .count() as u64
+    }
+
+    fn validate_user_buffer(
+        &self,
+        task_id: u64,
+        address: u64,
+        length: u64,
+        writable: bool,
+    ) -> UserBufferValidation {
+        let invalid = UserBufferValidation {
+            valid: false,
+            pages_checked: 0,
+            writable,
+        };
+        let Some(index) = self.find_task(task_id) else {
+            return invalid;
+        };
+        if self.slots[index].task.address_space_root == 0 || length > MAX_USER_BUFFER_BYTES {
+            return invalid;
+        }
+        if length == 0 {
+            return UserBufferValidation {
+                valid: true,
+                pages_checked: 0,
+                writable,
+            };
+        }
+        let Some(last_byte) = address.checked_add(length - 1) else {
+            return invalid;
+        };
+
+        let page_mask = !(paging::PAGE_SIZE_4K - 1);
+        let mut page = address & page_mask;
+        let final_page = last_byte & page_mask;
+        let mut pages_checked = 0u64;
+        loop {
+            let translation = self.slots[index].address_space.translate(page);
+            pages_checked = pages_checked.saturating_add(1);
+            if !translation.mapped
+                || !translation.user_accessible
+                || (writable && !translation.writable)
+            {
+                return UserBufferValidation {
+                    valid: false,
+                    pages_checked,
+                    writable,
+                };
+            }
+            if page == final_page {
+                break;
+            }
+            let Some(next) = page.checked_add(paging::PAGE_SIZE_4K) else {
+                return UserBufferValidation {
+                    valid: false,
+                    pages_checked,
+                    writable,
+                };
+            };
+            page = next;
+        }
+
+        UserBufferValidation {
+            valid: true,
+            pages_checked,
+            writable,
+        }
+    }
+
     fn free_slot(&self) -> Option<usize> {
         for index in 0..MAX_TASKS {
             let task = self.slots[index].task;
             if task.state == TaskState::Empty
-                || (task.state == TaskState::Exited && !task.resources_active)
+                || (task.state == TaskState::Exited
+                    && !task.resources_active
+                    && task.parent_id == 0)
             {
                 return Some(index);
             }
@@ -689,6 +966,29 @@ pub fn snapshot() -> Snapshot {
 
 pub fn task(index: usize) -> Option<Task> {
     cpu_interrupts::without_interrupts(|| table().task(index))
+}
+
+pub fn task_by_id(id: u64) -> Option<Task> {
+    cpu_interrupts::without_interrupts(|| table().task_by_id(id))
+}
+
+pub fn child_count(parent_id: u64) -> u64 {
+    cpu_interrupts::without_interrupts(|| table().child_count(parent_id))
+}
+
+pub fn wait_child(parent_id: u64, child_id: u64) -> WaitResult {
+    cpu_interrupts::without_interrupts(|| table_mut().wait_child(parent_id, child_id))
+}
+
+pub fn validate_user_buffer(
+    task_id: u64,
+    address: u64,
+    length: u64,
+    writable: bool,
+) -> UserBufferValidation {
+    cpu_interrupts::without_interrupts(|| {
+        table().validate_user_buffer(task_id, address, length, writable)
+    })
 }
 
 pub fn on_timer_interrupt(context: &mut interrupts::TimerContext) -> TimerAction {
@@ -796,6 +1096,130 @@ pub fn run_isolation_test() -> IsolationReport {
         distinct_user_frames,
         first,
         second,
+        frames_restored,
+        heap_restored,
+        resources_restored,
+        passed,
+    }
+}
+
+pub fn run_process_tree_test() -> ProcessTreeReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let process_before = snapshot();
+    let scheduler_before = scheduler::snapshot();
+
+    let parent = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let child = match parent {
+        Some(parent) => {
+            cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_child(parent.id))
+        }
+        None => None,
+    };
+    let parent_id = parent.map(|task| task.id).unwrap_or(0);
+    let child_id = child.map(|task| task.id).unwrap_or(0);
+    let relation_registered = parent_id != 0
+        && child_id != 0
+        && child
+            .map(|task| task.parent_id == parent_id)
+            .unwrap_or(false)
+        && child_count(parent_id) == 1;
+    let user_buffer_validation = parent
+        .map(|task| {
+            let code = validate_user_buffer(task.id, task.entry_point, 4, false);
+            let stack = validate_user_buffer(task.id, task.stack_top - 16, 16, true);
+            let kernel = validate_user_buffer(task.id, 0x000b_8000, 16, false);
+            let overflow = validate_user_buffer(task.id, u64::MAX - 7, 16, false);
+            code.valid
+                && code.pages_checked == 1
+                && stack.valid
+                && stack.writable
+                && !kernel.valid
+                && !overflow.valid
+        })
+        .unwrap_or(false);
+
+    let initial_wait = wait_child(parent_id, child_id);
+    let scheduler_blocked = scheduler::snapshot();
+    let parent_blocked = initial_wait.found
+        && initial_wait.blocked
+        && task_by_id(parent_id)
+            .map(|task| task.state == TaskState::Blocked && task.wait_target == child_id)
+            .unwrap_or(false)
+        && scheduler_blocked.blocked_tasks == scheduler_before.blocked_tasks.saturating_add(1);
+
+    let child_result = run_spawned_task(
+        child,
+        0,
+        0,
+        user_program::INIT_EXPECTED_EXIT_CODE,
+        user_program::INIT_MINIMUM_SYSCALLS,
+    );
+    let scheduler_woken = scheduler::snapshot();
+    let parent_woken = task_by_id(parent_id)
+        .map(|task| task.state == TaskState::Ready && task.wait_target == 0)
+        .unwrap_or(false)
+        && scheduler_woken.blocked_tasks == scheduler_before.blocked_tasks
+        && scheduler_woken.wake_events > scheduler_before.wake_events;
+
+    let completed_wait = wait_child(parent_id, child_id);
+    let child_reaped = completed_wait.reaped
+        && completed_wait.child_id == child_id
+        && completed_wait.exit_code == user_program::INIT_EXPECTED_EXIT_CODE
+        && task_by_id(child_id).is_none();
+    let parent_result = run_spawned_task(
+        parent,
+        0,
+        0,
+        user_program::INIT_EXPECTED_EXIT_CODE,
+        user_program::INIT_MINIMUM_SYSCALLS,
+    );
+
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let process_after = snapshot();
+    let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_restored = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resources_restored = process_after.active_resources == resources_before;
+    let passed = relation_registered
+        && parent_blocked
+        && child_result.passed
+        && parent_woken
+        && child_reaped
+        && parent_result.passed
+        && user_buffer_validation
+        && process_after.reaped_total > process_before.reaped_total
+        && process_after.wait_blocks > process_before.wait_blocks
+        && process_after.parent_wakeups > process_before.parent_wakeups
+        && frames_restored
+        && heap_restored
+        && resources_restored;
+
+    serial::log_bool("process", "parent child relation", relation_registered);
+    serial::log_bool("process", "parent blocked on wait", parent_blocked);
+    serial::log_bool("process", "parent wakeup", parent_woken);
+    serial::log_bool("process", "child reaped", child_reaped);
+    serial::log_bool("process", "user buffer validation", user_buffer_validation);
+    serial::log_bool("process", "process tree test", passed);
+
+    ProcessTreeReport {
+        parent_id,
+        child_id,
+        relation_registered,
+        parent_blocked,
+        parent_woken,
+        child_exited: child_result.passed,
+        child_reaped,
+        child_exit_code: completed_wait.exit_code,
+        parent_completed: parent_result.passed,
+        user_buffer_validation,
         frames_restored,
         heap_restored,
         resources_restored,
@@ -1031,16 +1455,20 @@ fn run_spawned_task(
 pub fn selftest() -> bool {
     let snapshot = snapshot();
     let address_spaces = paging::address_space_stats();
+    let scheduler_state = scheduler::snapshot();
 
     snapshot.initialized
         && snapshot.task_capacity == MAX_TASKS as u64
         && snapshot.running_tasks == 0
+        && snapshot.blocked_tasks == 0
+        && snapshot.zombie_children == 0
         && snapshot.active_resources == 0
         && !snapshot.preemption_active
         && snapshot.cleanup_failures == 0
         && snapshot.next_task_id >= 1
         && address_spaces.active == 0
         && address_spaces.cleanup_failures == 0
+        && scheduler_state.blocked_tasks == 0
         && scheduler::selftest()
         && user::probe_entry_point() != 0
         && user::probe_stack_top() != 0
@@ -1083,6 +1511,7 @@ pub fn state_name(state: TaskState) -> &'static str {
         TaskState::Empty => "empty",
         TaskState::Ready => "ready",
         TaskState::Running => "running",
+        TaskState::Blocked => "blocked",
         TaskState::Exited => "exited",
     }
 }
