@@ -84,6 +84,9 @@ fn build_init_code() -> Vec<u8> {
 
     emit_mov_rax(&mut code, 7);
     emit_int80(&mut code);
+
+    emit_mov_rax(&mut code, 8);
+    emit_int80(&mut code);
     code.extend_from_slice(&[0x49, 0x89, 0xc4]);
 
     emit_mov_rax(&mut code, 5);

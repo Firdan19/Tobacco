@@ -281,6 +281,8 @@ fn run_command_table_checks() {
     check("command ipc", shell::command_exists(b"ipc"));
     check("command ipctest", shell::command_exists(b"ipctest"));
     check("command ipchandoff", shell::command_exists(b"ipchandoff"));
+    check("command caps", shell::command_exists(b"caps"));
+    check("command captest", shell::command_exists(b"captest"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command preempt", shell::command_exists(b"preempt"));
@@ -482,7 +484,9 @@ fn run_selftest_checks() -> bool {
             && ipc_state.endpoint_capacity == ipc::MAX_ENDPOINTS as u64
             && ipc_state.queue_depth == ipc::QUEUE_DEPTH as u64
             && ipc_state.max_message_bytes == ipc::MAX_MESSAGE_BYTES as u64
+            && ipc_state.capability_slots_per_endpoint == ipc::MAX_CAPABILITIES_PER_ENDPOINT as u64
             && ipc_state.active_endpoints == 0
+            && ipc_state.active_capabilities == 0
             && ipc_state.queued_messages == 0
             && ipc::selftest(),
     );
@@ -500,7 +504,7 @@ fn run_selftest_checks() -> bool {
         "selftest keyboard queue sane",
         keyboard::pending_events() < 256,
     );
-    ok &= check("selftest command table sane", shell::command_count() >= 59);
+    ok &= check("selftest command table sane", shell::command_count() >= 61);
 
     ok
 }
@@ -789,6 +793,7 @@ fn run_ipc_checks() -> bool {
     let scheduler_before = scheduler::snapshot();
     let report = process::run_ipc_test();
     let handoff = process::run_ipc_handoff_test();
+    let capability = process::run_capability_test();
     let ipc_after = ipc::snapshot();
     let scheduler_after = scheduler::snapshot();
     let mut ok = true;
@@ -825,13 +830,40 @@ fn run_ipc_checks() -> bool {
     ok &= check("ipc handoff heap baseline", handoff.heap_restored);
     ok &= check("ipc handoff resource baseline", handoff.resources_restored);
     ok &= check("ipc handoff status", handoff.passed);
+    ok &= check("ipc capability self handle", capability.self_capability);
+    ok &= check(
+        "ipc capability authorized delivery",
+        capability.authorized_delivery,
+    );
+    ok &= check("ipc capability invalid denied", capability.invalid_denied);
+    ok &= check(
+        "ipc capability permission denied",
+        capability.permission_denied,
+    );
+    ok &= check("ipc capability revoked denied", capability.revoked_denied);
+    ok &= check(
+        "ipc capability generation advanced",
+        capability.generation_advanced,
+    );
+    ok &= check("ipc capability cleanup revoked", capability.cleanup_revoked);
+    ok &= check("ipc capability baseline", capability.capability_baseline);
+    ok &= check("ipc capability frame baseline", capability.frames_restored);
+    ok &= check("ipc capability heap baseline", capability.heap_restored);
+    ok &= check(
+        "ipc capability resource baseline",
+        capability.resources_restored,
+    );
+    ok &= check("ipc capability status", capability.passed);
     ok &= check(
         "ipc accounting",
-        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(14)
-            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(14)
+        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(15)
+            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(15)
             && ipc_after.blocked_receives > ipc_before.blocked_receives
             && ipc_after.receiver_wakeups > ipc_before.receiver_wakeups
-            && ipc_after.queue_full_events > ipc_before.queue_full_events,
+            && ipc_after.queue_full_events > ipc_before.queue_full_events
+            && ipc_after.capability_denials >= ipc_before.capability_denials.saturating_add(4)
+            && ipc_after.stale_capability_denials
+                >= ipc_before.stale_capability_denials.saturating_add(2),
     );
     ok &= check(
         "ipc scheduler wakeup",

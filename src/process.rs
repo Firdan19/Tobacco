@@ -343,6 +343,24 @@ pub struct IpcHandoffReport {
     pub passed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct CapabilityTestReport {
+    pub owner_id: u64,
+    pub target_id: u64,
+    pub self_capability: bool,
+    pub authorized_delivery: bool,
+    pub invalid_denied: bool,
+    pub permission_denied: bool,
+    pub revoked_denied: bool,
+    pub generation_advanced: bool,
+    pub cleanup_revoked: bool,
+    pub capability_baseline: bool,
+    pub frames_restored: bool,
+    pub heap_restored: bool,
+    pub resources_restored: bool,
+    pub passed: bool,
+}
+
 struct ProcessSlot {
     task: Task,
     address_space: paging::AddressSpace,
@@ -631,7 +649,7 @@ impl ProcessTable {
     fn install_ipc_handoff_program(
         &mut self,
         task_id: u64,
-        peer_id: u64,
+        peer_capability: u64,
         receiver_first: bool,
     ) -> bool {
         let Some(index) = self.find_task(task_id) else {
@@ -654,15 +672,15 @@ impl ProcessTable {
         let mut program = UserCodeBuilder::new();
         if receiver_first {
             program.receive();
-            program.send(peer_id, IPC_TEST_DATA);
+            program.send(peer_capability, IPC_TEST_DATA);
             program.receive();
-            program.send(peer_id, IPC_TEST_DATA + 4);
+            program.send(peer_capability, IPC_TEST_DATA + 4);
             program.receive();
             program.bytes(&[0xf4, 0xeb, 0xfd]);
         } else {
-            program.send(peer_id, IPC_TEST_DATA);
+            program.send(peer_capability, IPC_TEST_DATA);
             program.receive();
-            program.send(peer_id, IPC_TEST_DATA + 4);
+            program.send(peer_capability, IPC_TEST_DATA + 4);
             program.receive();
             program.exit(IPC_TEST_EXIT_CODE);
             program.bytes(&[0xf4, 0xeb, 0xfd]);
@@ -1687,6 +1705,7 @@ pub fn run_ipc_test() -> IpcTestReport {
     let resources_after = snapshot().active_resources;
     let ipc_after = ipc::snapshot();
     let endpoint_cleanup = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.active_capabilities == ipc_before.active_capabilities
         && ipc_after.queued_messages == ipc_before.queued_messages
         && ipc_after.waiting_receivers == ipc_before.waiting_receivers;
     let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
@@ -1750,11 +1769,24 @@ pub fn run_ipc_handoff_test() -> IpcHandoffReport {
     let receiver_id = receiver.map(|task| task.id).unwrap_or(0);
     let sender_id = sender.map(|task| task.id).unwrap_or(0);
 
-    let configured = if receiver_id != 0 && sender_id != 0 {
+    let receiver_to_sender = if receiver_id != 0 && sender_id != 0 {
+        ipc::grant_capability(receiver_id, sender_id, ipc::CapabilityRights::SEND).ok()
+    } else {
+        None
+    };
+    let sender_to_receiver = if receiver_id != 0 && sender_id != 0 {
+        ipc::grant_capability(sender_id, receiver_id, ipc::CapabilityRights::SEND).ok()
+    } else {
+        None
+    };
+
+    let configured = if let (Some(receiver_handle), Some(sender_handle)) =
+        (receiver_to_sender, sender_to_receiver)
+    {
         cpu_interrupts::without_interrupts(|| {
             let table = table_mut();
-            table.install_ipc_handoff_program(receiver_id, sender_id, true)
-                && table.install_ipc_handoff_program(sender_id, receiver_id, false)
+            table.install_ipc_handoff_program(receiver_id, receiver_handle, true)
+                && table.install_ipc_handoff_program(sender_id, sender_handle, false)
         })
     } else {
         false
@@ -1822,6 +1854,7 @@ pub fn run_ipc_handoff_test() -> IpcHandoffReport {
     let resources_after = snapshot().active_resources;
     let ipc_after = ipc::snapshot();
     let endpoints_cleaned = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.active_capabilities == ipc_before.active_capabilities
         && ipc_after.queued_messages == ipc_before.queued_messages
         && ipc_after.waiting_receivers == ipc_before.waiting_receivers;
     let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
@@ -1859,6 +1892,133 @@ pub fn run_ipc_handoff_test() -> IpcHandoffReport {
         messages_sent,
         messages_received,
         endpoints_cleaned,
+        frames_restored,
+        heap_restored,
+        resources_restored,
+        passed,
+    }
+}
+
+pub fn run_capability_test() -> CapabilityTestReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let ipc_before = ipc::snapshot();
+    let owner = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let target = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let owner_id = owner.map(|task| task.id).unwrap_or(0);
+    let target_id = target.map(|task| task.id).unwrap_or(0);
+
+    let self_handle = ipc::self_capability(owner_id).ok();
+    let send_handle = ipc::grant_capability(owner_id, target_id, ipc::CapabilityRights::SEND).ok();
+    let receive_only =
+        ipc::grant_capability(owner_id, owner_id, ipc::CapabilityRights::RECEIVE).ok();
+    let mut output = [0u8; ipc::MAX_MESSAGE_BYTES];
+    let authorized_delivery = send_handle
+        .map(|handle| ipc::send_capability(owner_id, handle, b"cap").is_ok())
+        .unwrap_or(false)
+        && matches!(
+            ipc::receive(target_id, &mut output, false),
+            Ok(ipc::ReceiveOutcome::Message(ipc::Delivery {
+                sender,
+                length: 3,
+                ..
+            })) if sender == owner_id
+        )
+        && &output[..3] == b"cap";
+    let invalid_denied =
+        ipc::send_capability(owner_id, 0, b"invalid") == Err(ipc::IpcError::InvalidCapability);
+    let permission_denied = receive_only
+        .map(|handle| {
+            ipc::send_capability(owner_id, handle, b"denied")
+                == Err(ipc::IpcError::PermissionDenied)
+        })
+        .unwrap_or(false);
+    let revoked_denied = send_handle
+        .map(|handle| {
+            ipc::revoke_capability(owner_id, handle).is_ok()
+                && ipc::send_capability(owner_id, handle, b"revoked")
+                    == Err(ipc::IpcError::StaleCapability)
+        })
+        .unwrap_or(false);
+    let replacement = ipc::grant_capability(owner_id, target_id, ipc::CapabilityRights::SEND).ok();
+    let generation_advanced =
+        matches!((send_handle, replacement), (Some(old), Some(new)) if old != new);
+
+    let syscalls = user::snapshot().syscall_count;
+    if target_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(target_id, 0, syscalls);
+            let _ = table_mut().cleanup_task(target_id);
+        });
+    }
+    let cleanup_revoked = replacement
+        .map(|handle| {
+            ipc::send_capability(owner_id, handle, b"cleanup")
+                == Err(ipc::IpcError::StaleCapability)
+        })
+        .unwrap_or(false);
+    if owner_id != 0 {
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(owner_id, 0, syscalls);
+            let _ = table_mut().cleanup_task(owner_id);
+        });
+    }
+
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let resources_after = snapshot().active_resources;
+    let ipc_after = ipc::snapshot();
+    let capability_baseline = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.active_capabilities == ipc_before.active_capabilities
+        && ipc_after.queued_messages == ipc_before.queued_messages
+        && ipc_after.capability_denials >= ipc_before.capability_denials.saturating_add(4)
+        && ipc_after.stale_capability_denials
+            >= ipc_before.stale_capability_denials.saturating_add(2);
+    let frames_restored = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_restored = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resources_restored = resources_after == resources_before;
+    let passed = owner_id != 0
+        && target_id != 0
+        && self_handle.is_some()
+        && authorized_delivery
+        && invalid_denied
+        && permission_denied
+        && revoked_denied
+        && generation_advanced
+        && cleanup_revoked
+        && capability_baseline
+        && frames_restored
+        && heap_restored
+        && resources_restored
+        && ipc::selftest();
+
+    serial::log_bool("ipc-cap", "self capability", self_handle.is_some());
+    serial::log_bool("ipc-cap", "authorized delivery", authorized_delivery);
+    serial::log_bool("ipc-cap", "invalid denied", invalid_denied);
+    serial::log_bool("ipc-cap", "permission denied", permission_denied);
+    serial::log_bool("ipc-cap", "revoked denied", revoked_denied);
+    serial::log_bool("ipc-cap", "generation advanced", generation_advanced);
+    serial::log_bool("ipc-cap", "cleanup revoked", cleanup_revoked);
+    serial::log_bool("ipc-cap", "capability test", passed);
+
+    CapabilityTestReport {
+        owner_id,
+        target_id,
+        self_capability: self_handle.is_some(),
+        authorized_delivery,
+        invalid_denied,
+        permission_denied,
+        revoked_denied,
+        generation_advanced,
+        cleanup_revoked,
+        capability_baseline,
         frames_restored,
         heap_restored,
         resources_restored,

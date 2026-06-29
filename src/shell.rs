@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 59] = [
+const COMMANDS: [Command; 61] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -250,6 +250,16 @@ const COMMANDS: [Command; 59] = [
         name: "ipchandoff",
         description: "uji blocking IPC antarprocess Ring 3",
         handler: command_ipchandoff,
+    },
+    Command {
+        name: "caps",
+        description: "status capability endpoint IPC",
+        handler: command_capabilities,
+    },
+    Command {
+        name: "captest",
+        description: "uji izin revoke dan stale capability",
+        handler: command_captest,
     },
     Command {
         name: "gdt",
@@ -1147,6 +1157,7 @@ fn print_health_report() -> u64 {
         "ipc mailboxes",
         ipc_state.initialized
             && ipc_state.active_endpoints == 0
+            && ipc_state.active_capabilities == 0
             && ipc_state.queued_messages == 0
             && ipc_state.waiting_receivers == 0
             && ipc::selftest(),
@@ -1168,7 +1179,7 @@ fn print_health_report() -> u64 {
         keyboard::pending_events() < 256,
         &mut issues,
     );
-    health_line("command table", COMMANDS.len() >= 59, &mut issues);
+    health_line("command table", COMMANDS.len() >= 61, &mut issues);
     health_line("last panic", !panic.present, &mut issues);
 
     issues
@@ -1286,6 +1297,7 @@ fn health_issue_count() -> u64 {
     count_issue(
         ipc_state.initialized
             && ipc_state.active_endpoints == 0
+            && ipc_state.active_capabilities == 0
             && ipc_state.queued_messages == 0
             && ipc_state.waiting_receivers == 0
             && ipc::selftest(),
@@ -1298,7 +1310,7 @@ fn health_issue_count() -> u64 {
     );
     count_issue(ticks >= counters.shell_ready_tick, &mut issues);
     count_issue(keyboard::pending_events() < 256, &mut issues);
-    count_issue(COMMANDS.len() >= 59, &mut issues);
+    count_issue(COMMANDS.len() >= 61, &mut issues);
     count_issue(!panic.present, &mut issues);
 
     issues
@@ -2363,6 +2375,13 @@ fn command_ipc(_arguments: &[u8]) {
     print_counter("receiver wakeups", snapshot.receiver_wakeups);
     print_counter("queue full", snapshot.queue_full_events);
     print_counter("cleanup drops", snapshot.dropped_on_cleanup);
+    print_counter("cap slots/task", snapshot.capability_slots_per_endpoint);
+    print_counter("active caps", snapshot.active_capabilities);
+    print_counter("caps granted", snapshot.capabilities_granted);
+    print_counter("caps revoked", snapshot.capabilities_revoked);
+    print_counter("cleanup revokes", snapshot.capabilities_revoked_on_cleanup);
+    print_counter("cap denials", snapshot.capability_denials);
+    print_counter("stale denials", snapshot.stale_capability_denials);
     print_counter("blocking switches", scheduler_state.blocking_switches);
     print_counter("restart completions", process_state.ipc_restart_completions);
     print("  selftest         : ");
@@ -2386,6 +2405,92 @@ fn command_ipchandoff(_arguments: &[u8]) {
     newline();
     print("  endpoint cleanup : ");
     print_on_off(report.endpoints_cleaned);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frames_restored);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_restored);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
+fn command_capabilities(_arguments: &[u8]) {
+    let snapshot = ipc::snapshot();
+    println("IPC capability tables:");
+    print_counter("slots per task", snapshot.capability_slots_per_endpoint);
+    print_counter("active", snapshot.active_capabilities);
+    print_counter("granted", snapshot.capabilities_granted);
+    print_counter("revoked", snapshot.capabilities_revoked);
+    print_counter("cleanup revoked", snapshot.capabilities_revoked_on_cleanup);
+    print_counter("denied", snapshot.capability_denials);
+    print_counter("stale denied", snapshot.stale_capability_denials);
+    print_counter("last generation", snapshot.last_capability_generation);
+
+    for task_index in 0..process::MAX_TASKS {
+        let Some(task) = process::task(task_index) else {
+            continue;
+        };
+        for slot in 0..ipc::MAX_CAPABILITIES_PER_ENDPOINT {
+            let Some(capability) = ipc::capability_info(task.id, slot) else {
+                continue;
+            };
+            if !capability.active {
+                continue;
+            }
+            print("  task=");
+            print_u64(task.id);
+            print(" slot=");
+            print_u64(capability.slot);
+            print(" handle=");
+            print_hex_u64(capability.handle);
+            print(" target=");
+            print_u64(capability.target);
+            print(" rights=");
+            print_hex_u64(capability.rights as u64);
+            newline();
+        }
+    }
+}
+
+fn command_captest(_arguments: &[u8]) {
+    println("IPC capability security test:");
+    let report = process::run_capability_test();
+
+    print_counter("owner task", report.owner_id);
+    print_counter("target task", report.target_id);
+    print("  self capability  : ");
+    print_on_off(report.self_capability);
+    newline();
+    print("  authorized send  : ");
+    print_on_off(report.authorized_delivery);
+    newline();
+    print("  invalid denied   : ");
+    print_on_off(report.invalid_denied);
+    newline();
+    print("  rights denied    : ");
+    print_on_off(report.permission_denied);
+    newline();
+    print("  revoked denied   : ");
+    print_on_off(report.revoked_denied);
+    newline();
+    print("  new generation   : ");
+    print_on_off(report.generation_advanced);
+    newline();
+    print("  cleanup revoked  : ");
+    print_on_off(report.cleanup_revoked);
+    newline();
+    print("  cap baseline     : ");
+    print_on_off(report.capability_baseline);
     newline();
     print("  frame baseline   : ");
     print_on_off(report.frames_restored);
@@ -3020,7 +3125,9 @@ fn command_selftest(_arguments: &[u8]) {
         "ipc mailbox ready",
         ipc_state.initialized
             && ipc_state.endpoint_capacity == ipc::MAX_ENDPOINTS as u64
+            && ipc_state.capability_slots_per_endpoint == ipc::MAX_CAPABILITIES_PER_ENDPOINT as u64
             && ipc_state.active_endpoints == 0
+            && ipc_state.active_capabilities == 0
             && ipc_state.queued_messages == 0
             && ipc::selftest(),
         &mut passed,
@@ -3058,7 +3165,7 @@ fn command_selftest(_arguments: &[u8]) {
     );
     selftest_check(
         "command table sane",
-        COMMANDS.len() >= 59,
+        COMMANDS.len() >= 61,
         &mut passed,
         &mut failed,
     );

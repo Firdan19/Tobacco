@@ -5,8 +5,32 @@ use x86_64::instructions::interrupts as cpu_interrupts;
 pub const MAX_ENDPOINTS: usize = 8;
 pub const QUEUE_DEPTH: usize = 8;
 pub const MAX_MESSAGE_BYTES: usize = 64;
+pub const MAX_CAPABILITIES_PER_ENDPOINT: usize = 8;
+const CAPABILITY_SLOT_BITS: u64 = 8;
+const CAPABILITY_SLOT_MASK: u64 = (1 << CAPABILITY_SLOT_BITS) - 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityRights(u8);
+
+impl CapabilityRights {
+    pub const SEND: Self = Self(1 << 0);
+    pub const RECEIVE: Self = Self(1 << 1);
+    pub const SEND_RECEIVE: Self = Self(Self::SEND.0 | Self::RECEIVE.0);
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    const fn valid(self) -> bool {
+        self.0 != 0 && self.0 & !Self::SEND_RECEIVE.0 == 0
+    }
+
+    const fn contains(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcError {
     NotInitialized,
     InvalidTask,
@@ -18,6 +42,11 @@ pub enum IpcError {
     BufferTooSmall,
     BlockFailed,
     WakeFailed,
+    CapabilityCapacity,
+    InvalidCapability,
+    StaleCapability,
+    PermissionDenied,
+    InvalidRights,
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +86,42 @@ pub struct Snapshot {
     pub queue_full_events: u64,
     pub dropped_on_cleanup: u64,
     pub last_sequence: u64,
+    pub capability_slots_per_endpoint: u64,
+    pub active_capabilities: u64,
+    pub capabilities_granted: u64,
+    pub capabilities_revoked: u64,
+    pub capabilities_revoked_on_cleanup: u64,
+    pub capability_denials: u64,
+    pub stale_capability_denials: u64,
+    pub last_capability_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct CapabilityInfo {
+    pub slot: u64,
+    pub handle: u64,
+    pub target: u64,
+    pub rights: u8,
+    pub active: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Capability {
+    target: u64,
+    generation: u64,
+    rights: CapabilityRights,
+    active: bool,
+}
+
+impl Capability {
+    const fn empty() -> Self {
+        Self {
+            target: 0,
+            generation: 0,
+            rights: CapabilityRights(0),
+            active: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +150,7 @@ struct Endpoint {
     head: usize,
     len: usize,
     waiting: bool,
+    capabilities: [Capability; MAX_CAPABILITIES_PER_ENDPOINT],
 }
 
 impl Endpoint {
@@ -95,6 +161,7 @@ impl Endpoint {
             head: 0,
             len: 0,
             waiting: false,
+            capabilities: [Capability::empty(); MAX_CAPABILITIES_PER_ENDPOINT],
         }
     }
 
@@ -141,6 +208,13 @@ struct IpcState {
     dropped_on_cleanup: u64,
     next_sequence: u64,
     last_sequence: u64,
+    next_capability_generation: u64,
+    capabilities_granted: u64,
+    capabilities_revoked: u64,
+    capabilities_revoked_on_cleanup: u64,
+    capability_denials: u64,
+    stale_capability_denials: u64,
+    last_capability_generation: u64,
 }
 
 impl IpcState {
@@ -158,6 +232,13 @@ impl IpcState {
             dropped_on_cleanup: 0,
             next_sequence: 1,
             last_sequence: 0,
+            next_capability_generation: 1,
+            capabilities_granted: 0,
+            capabilities_revoked: 0,
+            capabilities_revoked_on_cleanup: 0,
+            capability_denials: 0,
+            stale_capability_denials: 0,
+            last_capability_generation: 0,
         }
     }
 
@@ -188,7 +269,15 @@ impl IpcState {
         };
         self.endpoints[index] = Endpoint::empty();
         self.endpoints[index].owner = task_id;
+        let generation = self.allocate_generation();
+        self.endpoints[index].capabilities[0] = Capability {
+            target: task_id,
+            generation,
+            rights: CapabilityRights::SEND_RECEIVE,
+            active: true,
+        };
         self.endpoints_created = self.endpoints_created.saturating_add(1);
+        self.capabilities_granted = self.capabilities_granted.saturating_add(1);
         Ok(())
     }
 
@@ -197,10 +286,167 @@ impl IpcState {
             return Err(IpcError::EndpointMissing);
         };
         let dropped = self.endpoints[index].len as u64;
+        let mut revoked = self.endpoints[index]
+            .capabilities
+            .iter()
+            .filter(|capability| capability.active)
+            .count() as u64;
         self.endpoints[index] = Endpoint::empty();
+        for endpoint in self.endpoints.iter_mut() {
+            if endpoint.owner == 0 {
+                continue;
+            }
+            for capability in endpoint.capabilities.iter_mut() {
+                if capability.active && capability.target == task_id {
+                    *capability = Capability::empty();
+                    revoked = revoked.saturating_add(1);
+                }
+            }
+        }
         self.endpoints_destroyed = self.endpoints_destroyed.saturating_add(1);
         self.dropped_on_cleanup = self.dropped_on_cleanup.saturating_add(dropped);
+        self.capabilities_revoked = self.capabilities_revoked.saturating_add(revoked);
+        self.capabilities_revoked_on_cleanup =
+            self.capabilities_revoked_on_cleanup.saturating_add(revoked);
         Ok(dropped)
+    }
+
+    fn self_capability(&self, task_id: u64) -> Result<u64, IpcError> {
+        let Some(index) = self.find(task_id) else {
+            return Err(IpcError::EndpointMissing);
+        };
+        let capability = self.endpoints[index].capabilities[0];
+        if !capability.active
+            || capability.target != task_id
+            || !capability.rights.contains(CapabilityRights::SEND_RECEIVE)
+        {
+            return Err(IpcError::PermissionDenied);
+        }
+        Ok(encode_handle(0, capability.generation))
+    }
+
+    fn grant(
+        &mut self,
+        owner: u64,
+        target: u64,
+        rights: CapabilityRights,
+    ) -> Result<u64, IpcError> {
+        if !rights.valid() || (rights.contains(CapabilityRights::RECEIVE) && owner != target) {
+            return Err(IpcError::InvalidRights);
+        }
+        if self.find(target).is_none() {
+            return Err(IpcError::EndpointMissing);
+        }
+        let Some(owner_index) = self.find(owner) else {
+            return Err(IpcError::EndpointMissing);
+        };
+        let Some(slot) = self.endpoints[owner_index]
+            .capabilities
+            .iter()
+            .position(|capability| !capability.active)
+        else {
+            return Err(IpcError::CapabilityCapacity);
+        };
+
+        let generation = self.allocate_generation();
+        self.endpoints[owner_index].capabilities[slot] = Capability {
+            target,
+            generation,
+            rights,
+            active: true,
+        };
+        self.capabilities_granted = self.capabilities_granted.saturating_add(1);
+        Ok(encode_handle(slot, generation))
+    }
+
+    fn revoke(&mut self, owner: u64, handle: u64) -> Result<(), IpcError> {
+        let Some(owner_index) = self.find(owner) else {
+            return Err(IpcError::EndpointMissing);
+        };
+        let (slot, generation) = decode_handle(handle).ok_or(IpcError::InvalidCapability)?;
+        let capability = self.endpoints[owner_index].capabilities[slot];
+        if !capability.active || capability.generation != generation {
+            self.record_denial(true);
+            return Err(IpcError::StaleCapability);
+        }
+        if slot == 0 {
+            self.record_denial(false);
+            return Err(IpcError::PermissionDenied);
+        }
+
+        self.endpoints[owner_index].capabilities[slot] = Capability::empty();
+        self.capabilities_revoked = self.capabilities_revoked.saturating_add(1);
+        Ok(())
+    }
+
+    fn resolve(
+        &mut self,
+        owner: u64,
+        handle: u64,
+        required: CapabilityRights,
+    ) -> Result<u64, IpcError> {
+        let Some(owner_index) = self.find(owner) else {
+            return Err(IpcError::EndpointMissing);
+        };
+        let Some((slot, generation)) = decode_handle(handle) else {
+            self.record_denial(false);
+            return Err(IpcError::InvalidCapability);
+        };
+        let capability = self.endpoints[owner_index].capabilities[slot];
+        if !capability.active || capability.generation != generation {
+            self.record_denial(true);
+            return Err(IpcError::StaleCapability);
+        }
+        if !capability.rights.contains(required) {
+            self.record_denial(false);
+            return Err(IpcError::PermissionDenied);
+        }
+        if self.find(capability.target).is_none() {
+            self.endpoints[owner_index].capabilities[slot] = Capability::empty();
+            self.record_denial(true);
+            return Err(IpcError::StaleCapability);
+        }
+        Ok(capability.target)
+    }
+
+    fn send_capability(
+        &mut self,
+        sender: u64,
+        handle: u64,
+        bytes: &[u8],
+    ) -> Result<(u64, bool, u64), IpcError> {
+        let receiver = self.resolve(sender, handle, CapabilityRights::SEND)?;
+        let (sequence, waiting) = self.send(sender, receiver, bytes)?;
+        Ok((sequence, waiting, receiver))
+    }
+
+    fn can_receive(&mut self, receiver: u64) -> Result<(), IpcError> {
+        let handle = self.self_capability(receiver)?;
+        let target = self.resolve(receiver, handle, CapabilityRights::RECEIVE)?;
+        if target != receiver {
+            self.record_denial(false);
+            return Err(IpcError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        let generation = self.next_capability_generation.max(1);
+        let max_generation = u64::MAX >> CAPABILITY_SLOT_BITS;
+        self.next_capability_generation = if generation >= max_generation {
+            1
+        } else {
+            generation + 1
+        };
+        self.last_capability_generation = generation;
+        generation
+    }
+
+    fn record_denial(&mut self, stale: bool) {
+        self.capability_denials = self.capability_denials.saturating_add(1);
+        if stale {
+            self.stale_capability_denials = self.stale_capability_denials.saturating_add(1);
+        }
     }
 
     fn send(&mut self, sender: u64, receiver: u64, bytes: &[u8]) -> Result<(u64, bool), IpcError> {
@@ -239,6 +485,7 @@ impl IpcState {
     }
 
     fn receive(&mut self, receiver: u64, output: &mut [u8]) -> Result<Delivery, IpcError> {
+        self.can_receive(receiver)?;
         let Some(index) = self.find(receiver) else {
             return Err(IpcError::EndpointMissing);
         };
@@ -273,6 +520,25 @@ impl IpcState {
         Ok(self.endpoints[index].len != 0)
     }
 
+    fn capability_info(&self, owner: u64, slot: usize) -> Option<CapabilityInfo> {
+        if slot >= MAX_CAPABILITIES_PER_ENDPOINT {
+            return None;
+        }
+        let endpoint = self.endpoints.get(self.find(owner)?)?;
+        let capability = endpoint.capabilities[slot];
+        Some(CapabilityInfo {
+            slot: slot as u64,
+            handle: if capability.active {
+                encode_handle(slot, capability.generation)
+            } else {
+                0
+            },
+            target: capability.target,
+            rights: capability.rights.bits(),
+            active: capability.active,
+        })
+    }
+
     fn find(&self, task_id: u64) -> Option<usize> {
         self.endpoints
             .iter()
@@ -283,6 +549,7 @@ impl IpcState {
         let mut active_endpoints = 0u64;
         let mut queued_messages = 0u64;
         let mut waiting_receivers = 0u64;
+        let mut active_capabilities = 0u64;
         for endpoint in self.endpoints.iter() {
             if endpoint.owner == 0 {
                 continue;
@@ -292,6 +559,13 @@ impl IpcState {
             if endpoint.waiting {
                 waiting_receivers = waiting_receivers.saturating_add(1);
             }
+            active_capabilities = active_capabilities.saturating_add(
+                endpoint
+                    .capabilities
+                    .iter()
+                    .filter(|capability| capability.active)
+                    .count() as u64,
+            );
         }
 
         Snapshot {
@@ -311,6 +585,14 @@ impl IpcState {
             queue_full_events: self.queue_full_events,
             dropped_on_cleanup: self.dropped_on_cleanup,
             last_sequence: self.last_sequence,
+            capability_slots_per_endpoint: MAX_CAPABILITIES_PER_ENDPOINT as u64,
+            active_capabilities,
+            capabilities_granted: self.capabilities_granted,
+            capabilities_revoked: self.capabilities_revoked,
+            capabilities_revoked_on_cleanup: self.capabilities_revoked_on_cleanup,
+            capability_denials: self.capability_denials,
+            stale_capability_denials: self.stale_capability_denials,
+            last_capability_generation: self.last_capability_generation,
         }
     }
 
@@ -321,6 +603,7 @@ impl IpcState {
                 .iter()
                 .all(|endpoint| endpoint.len <= QUEUE_DEPTH && endpoint.head < QUEUE_DEPTH)
             && endpoint_owners_unique(&self.endpoints)
+            && capability_tables_valid(&self.endpoints)
     }
 }
 
@@ -339,6 +622,11 @@ pub fn init() -> Snapshot {
     serial::log("ipc", "bounded mailbox ready");
     serial::log_u64("ipc", "endpoint capacity", MAX_ENDPOINTS as u64);
     serial::log_u64("ipc", "queue depth", QUEUE_DEPTH as u64);
+    serial::log_u64(
+        "ipc",
+        "capability slots per endpoint",
+        MAX_CAPABILITIES_PER_ENDPOINT as u64,
+    );
     snapshot()
 }
 
@@ -350,9 +638,35 @@ pub fn unregister_endpoint(task_id: u64) -> Result<u64, IpcError> {
     cpu_interrupts::without_interrupts(|| state_mut().unregister(task_id))
 }
 
+pub fn self_capability(task_id: u64) -> Result<u64, IpcError> {
+    cpu_interrupts::without_interrupts(|| state().self_capability(task_id))
+}
+
+pub fn grant_capability(
+    owner: u64,
+    target: u64,
+    rights: CapabilityRights,
+) -> Result<u64, IpcError> {
+    cpu_interrupts::without_interrupts(|| state_mut().grant(owner, target, rights))
+}
+
+pub fn revoke_capability(owner: u64, handle: u64) -> Result<(), IpcError> {
+    cpu_interrupts::without_interrupts(|| state_mut().revoke(owner, handle))
+}
+
 pub fn send(sender: u64, receiver: u64, bytes: &[u8]) -> Result<u64, IpcError> {
     let (sequence, wake_receiver) =
         cpu_interrupts::without_interrupts(|| state_mut().send(sender, receiver, bytes))?;
+    finish_send(sequence, wake_receiver, receiver)
+}
+
+pub fn send_capability(sender: u64, handle: u64, bytes: &[u8]) -> Result<u64, IpcError> {
+    let (sequence, wake_receiver, receiver) =
+        cpu_interrupts::without_interrupts(|| state_mut().send_capability(sender, handle, bytes))?;
+    finish_send(sequence, wake_receiver, receiver)
+}
+
+fn finish_send(sequence: u64, wake_receiver: bool, receiver: u64) -> Result<u64, IpcError> {
     if wake_receiver {
         if process::wake_from_ipc(receiver) {
             cpu_interrupts::without_interrupts(|| {
@@ -395,6 +709,7 @@ pub fn block_syscall(
     frame: &mut user::SyscallFrame,
 ) -> Result<SyscallBlockOutcome, IpcError> {
     cpu_interrupts::without_interrupts(|| {
+        state_mut().can_receive(receiver)?;
         if state().has_message(receiver)? {
             return Ok(SyscallBlockOutcome::MessageReady);
         }
@@ -415,6 +730,10 @@ pub fn snapshot() -> Snapshot {
     cpu_interrupts::without_interrupts(|| state().snapshot())
 }
 
+pub fn capability_info(owner: u64, slot: usize) -> Option<CapabilityInfo> {
+    cpu_interrupts::without_interrupts(|| state().capability_info(owner, slot))
+}
+
 pub fn selftest() -> bool {
     cpu_interrupts::without_interrupts(|| state().invariants()) && model_selftest()
 }
@@ -431,6 +750,11 @@ pub fn error_code(error: IpcError) -> u64 {
         IpcError::BufferTooSmall => 8,
         IpcError::BlockFailed => 9,
         IpcError::WakeFailed => 10,
+        IpcError::CapabilityCapacity => 11,
+        IpcError::InvalidCapability => 12,
+        IpcError::StaleCapability => 13,
+        IpcError::PermissionDenied => 14,
+        IpcError::InvalidRights => 15,
     }
 }
 
@@ -446,6 +770,11 @@ pub fn error_name(error: IpcError) -> &'static str {
         IpcError::BufferTooSmall => "buffer too small",
         IpcError::BlockFailed => "block failed",
         IpcError::WakeFailed => "wake failed",
+        IpcError::CapabilityCapacity => "capability capacity",
+        IpcError::InvalidCapability => "invalid capability",
+        IpcError::StaleCapability => "stale capability",
+        IpcError::PermissionDenied => "permission denied",
+        IpcError::InvalidRights => "invalid capability rights",
     }
 }
 
@@ -453,11 +782,21 @@ fn model_selftest() -> bool {
     let mut state = IpcState::new();
     state.init();
     let registered = state.register(1).is_ok() && state.register(2).is_ok();
-    let sent = state.send(1, 2, b"ping");
+    let self_capability = state.self_capability(1);
+    let send_capability = state.grant(1, 2, CapabilityRights::SEND);
+    let receive_only = state.grant(1, 1, CapabilityRights::RECEIVE);
+    let sent = send_capability.and_then(|handle| state.send_capability(1, handle, b"ping"));
     let mut output = [0u8; MAX_MESSAGE_BYTES];
     let received = state.receive(2, &mut output);
+    let permission_denied = receive_only
+        .and_then(|handle| state.send_capability(1, handle, b"denied"))
+        == Err(IpcError::PermissionDenied);
+    let revoked = send_capability.and_then(|handle| state.revoke(1, handle).map(|_| handle));
+    let stale_denied = revoked.and_then(|handle| state.send_capability(1, handle, b"stale"))
+        == Err(IpcError::StaleCapability);
     registered
-        && matches!(sent, Ok((1, false)))
+        && self_capability.is_ok()
+        && matches!(sent, Ok((1, false, 2)))
         && matches!(
             received,
             Ok(Delivery {
@@ -467,6 +806,8 @@ fn model_selftest() -> bool {
             })
         )
         && &output[..4] == b"ping"
+        && permission_denied
+        && stale_denied
         && state.unregister(1).is_ok()
         && state.unregister(2).is_ok()
         && state.snapshot().active_endpoints == 0
@@ -486,6 +827,64 @@ fn endpoint_owners_unique(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
         }
     }
     true
+}
+
+fn capability_tables_valid(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
+    for endpoint in endpoints.iter() {
+        if endpoint.owner == 0 {
+            if endpoint
+                .capabilities
+                .iter()
+                .any(|capability| capability.active)
+            {
+                return false;
+            }
+            continue;
+        }
+
+        let self_capability = endpoint.capabilities[0];
+        if !self_capability.active
+            || self_capability.target != endpoint.owner
+            || self_capability.generation == 0
+            || !self_capability
+                .rights
+                .contains(CapabilityRights::SEND_RECEIVE)
+        {
+            return false;
+        }
+
+        for capability in endpoint.capabilities.iter() {
+            if !capability.active {
+                continue;
+            }
+            if capability.generation == 0
+                || !capability.rights.valid()
+                || !endpoints
+                    .iter()
+                    .any(|target| target.owner == capability.target)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn encode_handle(slot: usize, generation: u64) -> u64 {
+    (generation << CAPABILITY_SLOT_BITS) | (slot as u64 + 1)
+}
+
+fn decode_handle(handle: u64) -> Option<(usize, u64)> {
+    let encoded_slot = handle & CAPABILITY_SLOT_MASK;
+    let generation = handle >> CAPABILITY_SLOT_BITS;
+    if encoded_slot == 0 || generation == 0 {
+        return None;
+    }
+    let slot = encoded_slot.saturating_sub(1) as usize;
+    if slot >= MAX_CAPABILITIES_PER_ENDPOINT {
+        return None;
+    }
+    Some((slot, generation))
 }
 
 fn state() -> &'static IpcState {
