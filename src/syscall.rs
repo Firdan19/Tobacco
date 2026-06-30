@@ -11,6 +11,7 @@ pub const SYSCALL_GETPID: u64 = 7;
 pub const SYSCALL_IPC_SELF: u64 = 8;
 pub const SYSCALL_IPC_RECEIVE_TIMEOUT: u64 = 9;
 pub const SYSCALL_IPC_CANCEL: u64 = 10;
+pub const SYSCALL_IPC_SEND_CAPABILITY: u64 = 11;
 
 pub const RET_OK: u64 = 0;
 pub const RET_UNKNOWN_SYSCALL: u64 = u64::MAX;
@@ -68,7 +69,7 @@ pub struct Snapshot {
     pub last_return: u64,
 }
 
-const SYSCALLS: [SyscallEntry; 10] = [
+const SYSCALLS: [SyscallEntry; 11] = [
     SyscallEntry {
         number: SYSCALL_LOG,
         name: "log",
@@ -148,6 +149,14 @@ const SYSCALLS: [SyscallEntry; 10] = [
         return_code: ReturnCode::Dynamic,
         logging: true,
         handler: syscall_ipc_cancel,
+    },
+    SyscallEntry {
+        number: SYSCALL_IPC_SEND_CAPABILITY,
+        name: "ipc_send_capability",
+        arg_count: 5,
+        return_code: ReturnCode::Dynamic,
+        logging: true,
+        handler: syscall_ipc_send_capability,
     },
 ];
 
@@ -232,7 +241,7 @@ pub fn lookup(number: u64) -> Option<&'static SyscallEntry> {
 
 pub fn selftest() -> bool {
     INITIALIZED.load(Ordering::Acquire)
-        && SYSCALLS.len() == 10
+        && SYSCALLS.len() == 11
         && lookup(SYSCALL_LOG).is_some()
         && lookup(SYSCALL_UPTIME).is_some()
         && lookup(SYSCALL_EXIT).is_some()
@@ -243,6 +252,7 @@ pub fn selftest() -> bool {
         && lookup(SYSCALL_IPC_SELF).is_some()
         && lookup(SYSCALL_IPC_RECEIVE_TIMEOUT).is_some()
         && lookup(SYSCALL_IPC_CANCEL).is_some()
+        && lookup(SYSCALL_IPC_SEND_CAPABILITY).is_some()
         && table_numbers_unique()
         && SYSCALLS[0].arg_count == 1
         && SYSCALLS[1].arg_count == 0
@@ -254,6 +264,7 @@ pub fn selftest() -> bool {
         && SYSCALLS[7].arg_count == 0
         && SYSCALLS[8].arg_count == 3
         && SYSCALLS[9].arg_count == 1
+        && SYSCALLS[10].arg_count == 5
 }
 
 pub fn return_code_name(code: ReturnCode) -> &'static str {
@@ -352,6 +363,8 @@ fn syscall_ipc_receive_common(
             }
             frame.rdx = delivery.sender;
             frame.rcx = delivery.sequence;
+            frame.r8 = delivery.capability_handle;
+            frame.r9 = delivery.capability_rights as u64;
             frame.rax = delivery.length;
             serial::log_u64("ipc", "syscall receive bytes", delivery.length);
             let _ = process::complete_ipc_restart(receiver);
@@ -412,6 +425,41 @@ fn syscall_ipc_cancel(handle: u64, _frame: &mut user::SyscallFrame) -> SyscallOu
         }
     };
     SyscallOutcome::complete(result)
+}
+
+fn syscall_ipc_send_capability(
+    destination_handle: u64,
+    frame: &mut user::SyscallFrame,
+) -> SyscallOutcome {
+    let sender = scheduler::snapshot().current_task;
+    let length = frame.rdx as usize;
+    if sender == 0 || length > ipc::MAX_MESSAGE_BYTES {
+        return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::InvalidTask));
+    }
+    if frame.r8 > u8::MAX as u64 {
+        return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::InvalidRights));
+    }
+    let Some(requested_rights) = ipc::CapabilityRights::from_bits(frame.r8 as u8) else {
+        return SyscallOutcome::complete(ipc_error_return(ipc::IpcError::InvalidRights));
+    };
+
+    let mut message = [0u8; ipc::MAX_MESSAGE_BYTES];
+    if !process::copy_from_user(sender, frame.rsi, &mut message[..length]) {
+        return SyscallOutcome::complete(RET_INVALID_USER_BUFFER);
+    }
+    match ipc::send_with_capability(
+        sender,
+        destination_handle,
+        frame.rcx,
+        requested_rights,
+        &message[..length],
+    ) {
+        Ok(sequence) => {
+            serial::log_u64("ipc-cap", "syscall transfer bytes", length as u64);
+            SyscallOutcome::complete(sequence)
+        }
+        Err(error) => SyscallOutcome::complete(ipc_error_return(error)),
+    }
 }
 
 pub fn ipc_error_return(error: ipc::IpcError) -> u64 {

@@ -284,6 +284,7 @@ fn run_command_table_checks() {
     check("command caps", shell::command_exists(b"caps"));
     check("command captest", shell::command_exists(b"captest"));
     check("command ipcwait", shell::command_exists(b"ipcwait"));
+    check("command capxfer", shell::command_exists(b"capxfer"));
     check("command tasks", shell::command_exists(b"tasks"));
     check("command sched", shell::command_exists(b"sched"));
     check("command preempt", shell::command_exists(b"preempt"));
@@ -796,6 +797,7 @@ fn run_ipc_checks() -> bool {
     let handoff = process::run_ipc_handoff_test();
     let capability = process::run_capability_test();
     let wait_control = process::run_ipc_wait_control_test();
+    let transfer = process::run_capability_transfer_test();
     let ipc_after = ipc::snapshot();
     let scheduler_after = scheduler::snapshot();
     let mut ok = true;
@@ -884,16 +886,42 @@ fn run_ipc_checks() -> bool {
         wait_control.resources_restored,
     );
     ok &= check("ipc wait control status", wait_control.passed);
+    ok &= check("ipc transfer Ring 3", transfer.ring3_transfer);
+    ok &= check("ipc transfer received handle", transfer.received_handle);
+    ok &= check("ipc transfer rights attenuated", transfer.rights_attenuated);
+    ok &= check("ipc transfer delegation denied", transfer.delegation_denied);
+    ok &= check("ipc transfer escalation denied", transfer.escalation_denied);
+    ok &= check("ipc transfer forged denied", transfer.forged_denied);
+    ok &= check("ipc transfer queue full atomic", transfer.queue_full_atomic);
+    ok &= check("ipc transfer table full atomic", transfer.table_full_atomic);
+    ok &= check("ipc transfer cleanup revoked", transfer.cleanup_revoked);
+    ok &= check(
+        "ipc transfer blocking switches",
+        transfer.blocking_switches == 2,
+    );
+    ok &= check(
+        "ipc transfer restart completion",
+        transfer.restart_completions == 1,
+    );
+    ok &= check("ipc transfer scheduler clean", transfer.scheduler_clean);
+    ok &= check("ipc transfer frame baseline", transfer.frame_baseline);
+    ok &= check("ipc transfer heap baseline", transfer.heap_baseline);
+    ok &= check("ipc transfer resource baseline", transfer.resource_baseline);
+    ok &= check("ipc transfer status", transfer.passed);
     ok &= check(
         "ipc accounting",
-        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(15)
-            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(15)
+        ipc_after.messages_sent >= ipc_before.messages_sent.saturating_add(25)
+            && ipc_after.messages_received >= ipc_before.messages_received.saturating_add(25)
             && ipc_after.blocked_receives > ipc_before.blocked_receives
             && ipc_after.receiver_wakeups > ipc_before.receiver_wakeups
             && ipc_after.queue_full_events > ipc_before.queue_full_events
-            && ipc_after.capability_denials >= ipc_before.capability_denials.saturating_add(4)
+            && ipc_after.capability_denials >= ipc_before.capability_denials.saturating_add(7)
             && ipc_after.stale_capability_denials
-                >= ipc_before.stale_capability_denials.saturating_add(2),
+                >= ipc_before.stale_capability_denials.saturating_add(2)
+            && ipc_after.capability_transfers >= ipc_before.capability_transfers.saturating_add(1)
+            && ipc_after.rights_attenuations >= ipc_before.rights_attenuations.saturating_add(1)
+            && ipc_after.capability_transfer_failures
+                >= ipc_before.capability_transfer_failures.saturating_add(5),
     );
     ok &= check(
         "ipc scheduler wakeup",

@@ -20,7 +20,7 @@ struct Command {
     handler: fn(&[u8]),
 }
 
-const COMMANDS: [Command; 62] = [
+const COMMANDS: [Command; 63] = [
     Command {
         name: "help",
         description: "tampilkan daftar command",
@@ -265,6 +265,11 @@ const COMMANDS: [Command; 62] = [
         name: "ipcwait",
         description: "uji timeout dan cancellation IPC",
         handler: command_ipcwait,
+    },
+    Command {
+        name: "capxfer",
+        description: "uji transfer dan attenuasi capability",
+        handler: command_capability_transfer,
     },
     Command {
         name: "gdt",
@@ -2336,6 +2341,7 @@ fn command_syscall(_arguments: &[u8]) {
     println("  gate            : int 0x80");
     println("  number          : rax");
     println("  arg0            : rdi");
+    println("  arg1..arg4      : rsi rdx rcx r8");
     println("  return          : rax");
     print("  table           : ");
     print_on_off(snapshot.initialized && syscall::selftest());
@@ -2397,6 +2403,10 @@ fn command_ipc(_arguments: &[u8]) {
     print_counter("stale denials", snapshot.stale_capability_denials);
     print_counter("cancel requests", snapshot.cancellation_requests);
     print_counter("cancel success", snapshot.cancellation_successes);
+    print_counter("cap transfers", snapshot.capability_transfers);
+    print_counter("transfer failures", snapshot.capability_transfer_failures);
+    print_counter("rights attenuated", snapshot.rights_attenuations);
+    print_counter("last xfer rights", snapshot.last_transferred_rights);
     print_counter("blocking switches", scheduler_state.blocking_switches);
     print_counter("restart completions", process_state.ipc_restart_completions);
     print_counter("timeout wakeups", process_state.ipc_timeouts);
@@ -2453,6 +2463,10 @@ fn command_capabilities(_arguments: &[u8]) {
     print_counter("stale denied", snapshot.stale_capability_denials);
     print_counter("cancel requests", snapshot.cancellation_requests);
     print_counter("cancel success", snapshot.cancellation_successes);
+    print_counter("transfers", snapshot.capability_transfers);
+    print_counter("transfer failures", snapshot.capability_transfer_failures);
+    print_counter("attenuations", snapshot.rights_attenuations);
+    print_counter("last xfer rights", snapshot.last_transferred_rights);
     print_counter("last generation", snapshot.last_capability_generation);
 
     for task_index in 0..process::MAX_TASKS {
@@ -2558,6 +2572,62 @@ fn command_ipcwait(_arguments: &[u8]) {
     newline();
     print("  resource baseline: ");
     print_on_off(report.resources_restored);
+    newline();
+    print("  status           : ");
+    if report.passed {
+        println("PASS");
+    } else {
+        stats::inc_shell_error();
+        println("FAIL");
+    }
+}
+
+fn command_capability_transfer(_arguments: &[u8]) {
+    println("IPC capability transfer test:");
+    let report = process::run_capability_transfer_test();
+
+    print_counter("sender task", report.sender_id);
+    print_counter("receiver task", report.receiver_id);
+    print("  Ring 3 transfer  : ");
+    print_on_off(report.ring3_transfer);
+    newline();
+    print("  received handle  : ");
+    print_on_off(report.received_handle);
+    newline();
+    print("  rights attenuated: ");
+    print_on_off(report.rights_attenuated);
+    newline();
+    print("  delegate denied  : ");
+    print_on_off(report.delegation_denied);
+    newline();
+    print("  escalation denied: ");
+    print_on_off(report.escalation_denied);
+    newline();
+    print("  forged denied    : ");
+    print_on_off(report.forged_denied);
+    newline();
+    print("  queue atomic     : ");
+    print_on_off(report.queue_full_atomic);
+    newline();
+    print("  table atomic     : ");
+    print_on_off(report.table_full_atomic);
+    newline();
+    print("  cleanup revoked  : ");
+    print_on_off(report.cleanup_revoked);
+    newline();
+    print_counter("blocking switches", report.blocking_switches);
+    print_counter("restart complete", report.restart_completions);
+    print("  scheduler clean  : ");
+    print_on_off(report.scheduler_clean);
+    newline();
+    print("  frame baseline   : ");
+    print_on_off(report.frame_baseline);
+    newline();
+    print("  heap baseline    : ");
+    print_on_off(report.heap_baseline);
+    newline();
+    print("  resource baseline: ");
+    print_on_off(report.resource_baseline);
     newline();
     print("  status           : ");
     if report.passed {

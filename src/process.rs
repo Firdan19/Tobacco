@@ -80,6 +80,29 @@ impl UserCodeBuilder {
         self.syscall(crate::syscall::SYSCALL_IPC_CANCEL);
     }
 
+    fn send_capability(
+        &mut self,
+        destination: u64,
+        data: u64,
+        capability: u64,
+        rights: ipc::CapabilityRights,
+    ) {
+        self.mov_imm64(0xbf, destination);
+        self.mov_imm64(0xbe, data);
+        self.mov_imm64(0xba, 4);
+        self.mov_imm64(0xb9, capability);
+        self.mov_imm64(0xb8, rights.bits() as u64);
+        self.bytes(&[0x49, 0x89, 0xc0]);
+        self.syscall(crate::syscall::SYSCALL_IPC_SEND_CAPABILITY);
+    }
+
+    fn send_received_capability(&mut self, data: u64) {
+        self.bytes(&[0x4c, 0x89, 0xc7]);
+        self.mov_imm64(0xbe, data);
+        self.mov_imm64(0xba, 4);
+        self.syscall(crate::syscall::SYSCALL_IPC_SEND);
+    }
+
     fn wait_ticks(&mut self, ticks: u8) {
         self.syscall(crate::syscall::SYSCALL_UPTIME);
         self.bytes(&[0x49, 0x89, 0xc4]);
@@ -419,6 +442,28 @@ pub struct IpcWaitControlReport {
     pub frames_restored: bool,
     pub heap_restored: bool,
     pub resources_restored: bool,
+    pub passed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct CapabilityTransferReport {
+    pub sender_id: u64,
+    pub receiver_id: u64,
+    pub ring3_transfer: bool,
+    pub received_handle: bool,
+    pub rights_attenuated: bool,
+    pub delegation_denied: bool,
+    pub escalation_denied: bool,
+    pub forged_denied: bool,
+    pub queue_full_atomic: bool,
+    pub table_full_atomic: bool,
+    pub cleanup_revoked: bool,
+    pub blocking_switches: u64,
+    pub restart_completions: u64,
+    pub scheduler_clean: bool,
+    pub frame_baseline: bool,
+    pub heap_baseline: bool,
+    pub resource_baseline: bool,
     pub passed: bool,
 }
 
@@ -774,6 +819,31 @@ impl ProcessTable {
             program.receive_timeout(100);
             program.bytes(&[0xf4, 0xeb, 0xfd]);
         }
+        self.write_user_program(task_id, &program)
+    }
+
+    fn install_capability_transfer_program(
+        &mut self,
+        task_id: u64,
+        peer_capability: u64,
+        receiver: bool,
+    ) -> bool {
+        let mut program = UserCodeBuilder::new();
+        if receiver {
+            program.receive();
+            program.send_received_capability(IPC_TEST_DATA + 4);
+            program.receive();
+            program.exit(IPC_TEST_EXIT_CODE);
+        } else {
+            program.send_capability(
+                peer_capability,
+                IPC_TEST_DATA,
+                peer_capability,
+                ipc::CapabilityRights::SEND,
+            );
+            program.receive_timeout(100);
+        }
+        program.bytes(&[0xf4, 0xeb, 0xfd]);
         self.write_user_program(task_id, &program)
     }
 
@@ -2405,6 +2475,271 @@ pub fn run_ipc_wait_control_test() -> IpcWaitControlReport {
         frames_restored,
         heap_restored,
         resources_restored,
+        passed,
+    }
+}
+
+pub fn run_capability_transfer_test() -> CapabilityTransferReport {
+    let frames_before = crate::physmem::snapshot();
+    let heap_before = heap::snapshot();
+    let resources_before = snapshot().active_resources;
+    let process_before = snapshot();
+    let scheduler_before = scheduler::snapshot();
+    let ipc_before = ipc::snapshot();
+    let receiver = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let sender = cpu_interrupts::without_interrupts(|| table_mut().spawn_elf_init());
+    let receiver_id = receiver.map(|task| task.id).unwrap_or(0);
+    let sender_id = sender.map(|task| task.id).unwrap_or(0);
+
+    let peer_capability = if sender_id != 0 && receiver_id != 0 {
+        ipc::grant_capability(
+            sender_id,
+            receiver_id,
+            ipc::CapabilityRights::SEND_CANCEL_DELEGATE,
+        )
+        .ok()
+    } else {
+        None
+    };
+    let nondelegable_capability = if sender_id != 0 && receiver_id != 0 {
+        ipc::grant_capability(sender_id, receiver_id, ipc::CapabilityRights::SEND).ok()
+    } else {
+        None
+    };
+    let delegation_denied = match (peer_capability, nondelegable_capability) {
+        (Some(destination), Some(source)) => {
+            ipc::send_with_capability(
+                sender_id,
+                destination,
+                source,
+                ipc::CapabilityRights::SEND,
+                b"delegate",
+            ) == Err(ipc::IpcError::PermissionDenied)
+        }
+        _ => false,
+    };
+    let escalation_denied = peer_capability
+        .map(|handle| {
+            ipc::send_with_capability(
+                sender_id,
+                handle,
+                handle,
+                ipc::CapabilityRights::ALL,
+                b"escalate",
+            ) == Err(ipc::IpcError::RightsEscalation)
+        })
+        .unwrap_or(false);
+    let forged_denied = peer_capability
+        .map(|handle| {
+            ipc::send_with_capability(sender_id, handle, 0, ipc::CapabilityRights::SEND, b"forged")
+                == Err(ipc::IpcError::InvalidCapability)
+        })
+        .unwrap_or(false);
+    let configured = peer_capability
+        .map(|handle| {
+            cpu_interrupts::without_interrupts(|| {
+                let table = table_mut();
+                table.install_capability_transfer_program(receiver_id, 0, true)
+                    && table.install_capability_transfer_program(sender_id, handle, false)
+            })
+        })
+        .unwrap_or(false);
+
+    let mut ring3_ran = false;
+    let mut ring3_passed = false;
+    let mut exit_code = 0;
+    if configured {
+        let before = user::snapshot().syscall_count;
+        if cpu_interrupts::without_interrupts(|| table_mut().mark_running(receiver_id, before)) {
+            let result = user::run_program_in_address_space(
+                receiver.map(|task| task.entry_point).unwrap_or(0),
+                receiver.map(|task| task.stack_top).unwrap_or(0),
+                IPC_TEST_EXIT_CODE,
+                7,
+                receiver.map(|task| task.address_space_root).unwrap_or(0),
+            );
+            ring3_ran = result.ran;
+            ring3_passed = result.passed;
+            exit_code = result.exit_code;
+        }
+    }
+
+    let ipc_after_ring3 = ipc::snapshot();
+    let transferred_capability = (1..ipc::MAX_CAPABILITIES_PER_ENDPOINT)
+        .filter_map(|slot| ipc::capability_info(receiver_id, slot))
+        .find(|capability| {
+            capability.active
+                && capability.target == receiver_id
+                && capability.rights == ipc::CapabilityRights::SEND.bits()
+        });
+    let received_handle = transferred_capability
+        .map(|capability| capability.handle != 0)
+        .unwrap_or(false);
+    let rights_attenuated = transferred_capability.is_some()
+        && ipc_after_ring3.capability_transfers
+            == ipc_before.capability_transfers.saturating_add(1)
+        && ipc_after_ring3.rights_attenuations == ipc_before.rights_attenuations.saturating_add(1)
+        && ipc_after_ring3.last_transferred_rights == ipc::CapabilityRights::SEND.bits() as u64;
+    let ring3_transfer = ring3_ran
+        && ring3_passed
+        && exit_code == IPC_TEST_EXIT_CODE
+        && ipc_after_ring3.messages_sent >= ipc_before.messages_sent.saturating_add(2)
+        && ipc_after_ring3.messages_received >= ipc_before.messages_received.saturating_add(2);
+
+    let mut queue_filled = true;
+    if let Some(handle) = peer_capability {
+        for index in 0..ipc::QUEUE_DEPTH {
+            queue_filled &= ipc::send_capability(sender_id, handle, &[index as u8]).is_ok();
+        }
+    } else {
+        queue_filled = false;
+    }
+    let before_queue_failure = ipc::snapshot();
+    let queue_rejected = peer_capability
+        .map(|handle| {
+            ipc::send_with_capability(
+                sender_id,
+                handle,
+                handle,
+                ipc::CapabilityRights::SEND,
+                b"queue-full",
+            ) == Err(ipc::IpcError::QueueFull)
+        })
+        .unwrap_or(false);
+    let after_queue_failure = ipc::snapshot();
+    let queue_full_atomic = queue_filled
+        && queue_rejected
+        && after_queue_failure.queued_messages == before_queue_failure.queued_messages
+        && after_queue_failure.active_capabilities == before_queue_failure.active_capabilities
+        && after_queue_failure.capability_transfers == before_queue_failure.capability_transfers;
+    let mut drain = [0u8; ipc::MAX_MESSAGE_BYTES];
+    for _ in 0..ipc::QUEUE_DEPTH {
+        let _ = ipc::receive(receiver_id, &mut drain, false);
+    }
+
+    for _ in 0..ipc::MAX_CAPABILITIES_PER_ENDPOINT {
+        if ipc::grant_capability(receiver_id, receiver_id, ipc::CapabilityRights::SEND).is_err() {
+            break;
+        }
+    }
+    let receiver_table_full = (0..ipc::MAX_CAPABILITIES_PER_ENDPOINT).all(|slot| {
+        ipc::capability_info(receiver_id, slot)
+            .map(|capability| capability.active)
+            .unwrap_or(false)
+    });
+    let before_table_failure = ipc::snapshot();
+    let table_rejected = peer_capability
+        .map(|handle| {
+            ipc::send_with_capability(
+                sender_id,
+                handle,
+                handle,
+                ipc::CapabilityRights::SEND,
+                b"table-full",
+            ) == Err(ipc::IpcError::CapabilityCapacity)
+        })
+        .unwrap_or(false);
+    let after_table_failure = ipc::snapshot();
+    let table_full_atomic = receiver_table_full
+        && table_rejected
+        && after_table_failure.queued_messages == before_table_failure.queued_messages
+        && after_table_failure.active_capabilities == before_table_failure.active_capabilities
+        && after_table_failure.capability_transfers == before_table_failure.capability_transfers;
+
+    let syscalls = user::snapshot().syscall_count;
+    for (task_id, code) in [(sender_id, 0), (receiver_id, exit_code)] {
+        if task_id == 0 {
+            continue;
+        }
+        cpu_interrupts::without_interrupts(|| {
+            let _ = table_mut().mark_exited(task_id, code, syscalls);
+            let _ = table_mut().cleanup_task(task_id);
+        });
+    }
+
+    let ipc_after = ipc::snapshot();
+    let process_after = snapshot();
+    let scheduler_after = scheduler::snapshot();
+    let frames_after = crate::physmem::snapshot();
+    let heap_after = heap::snapshot();
+    let resources_after = snapshot().active_resources;
+    let cleanup_revoked = ipc_after.active_endpoints == ipc_before.active_endpoints
+        && ipc_after.active_capabilities == ipc_before.active_capabilities
+        && ipc_after.queued_messages == ipc_before.queued_messages
+        && ipc_after.waiting_receivers == ipc_before.waiting_receivers;
+    let blocking_switches = scheduler_after
+        .blocking_switches
+        .saturating_sub(scheduler_before.blocking_switches);
+    let restart_completions = process_after
+        .ipc_restart_completions
+        .saturating_sub(process_before.ipc_restart_completions);
+    let scheduler_clean = scheduler_after.current_task == scheduler_before.current_task
+        && scheduler_after.queued_tasks == scheduler_before.queued_tasks
+        && scheduler_after.blocked_tasks == scheduler_before.blocked_tasks;
+    let frame_baseline = frames_after.allocated_frames == frames_before.allocated_frames
+        && frames_after.free_frames == frames_before.free_frames;
+    let heap_baseline = heap_after.active_allocations == heap_before.active_allocations
+        && heap_after.allocated_bytes == heap_before.allocated_bytes
+        && heap_after.free_bytes == heap_before.free_bytes
+        && heap_after.metadata_ok
+        && heap_after.sentinel_ok
+        && heap_after.allocation_canaries_ok;
+    let resource_baseline = resources_after == resources_before;
+    let transfer_failures = ipc_after
+        .capability_transfer_failures
+        .saturating_sub(ipc_before.capability_transfer_failures);
+    let passed = sender_id != 0
+        && receiver_id != 0
+        && ring3_transfer
+        && received_handle
+        && rights_attenuated
+        && delegation_denied
+        && escalation_denied
+        && forged_denied
+        && queue_full_atomic
+        && table_full_atomic
+        && transfer_failures == 5
+        && cleanup_revoked
+        && blocking_switches == 2
+        && restart_completions == 1
+        && scheduler_clean
+        && frame_baseline
+        && heap_baseline
+        && resource_baseline
+        && ipc::selftest();
+
+    serial::log_bool("ipc-xfer", "Ring 3 capability transfer", ring3_transfer);
+    serial::log_bool("ipc-xfer", "received handle", received_handle);
+    serial::log_bool("ipc-xfer", "rights attenuated", rights_attenuated);
+    serial::log_bool("ipc-xfer", "delegation denied", delegation_denied);
+    serial::log_bool("ipc-xfer", "escalation denied", escalation_denied);
+    serial::log_bool("ipc-xfer", "forged denied", forged_denied);
+    serial::log_bool("ipc-xfer", "queue full atomic", queue_full_atomic);
+    serial::log_bool("ipc-xfer", "table full atomic", table_full_atomic);
+    serial::log_bool("ipc-xfer", "cleanup revoked", cleanup_revoked);
+    serial::log_u64("ipc-xfer", "blocking switches", blocking_switches);
+    serial::log_u64("ipc-xfer", "restart completions", restart_completions);
+    serial::log_bool("ipc-xfer", "scheduler clean", scheduler_clean);
+    serial::log_bool("ipc-xfer", "capability transfer test", passed);
+
+    CapabilityTransferReport {
+        sender_id,
+        receiver_id,
+        ring3_transfer,
+        received_handle,
+        rights_attenuated,
+        delegation_denied,
+        escalation_denied,
+        forged_denied,
+        queue_full_atomic,
+        table_full_atomic,
+        cleanup_revoked,
+        blocking_switches,
+        restart_completions,
+        scheduler_clean,
+        frame_baseline,
+        heap_baseline,
+        resource_baseline,
         passed,
     }
 }

@@ -16,18 +16,31 @@ impl CapabilityRights {
     pub const SEND: Self = Self(1 << 0);
     pub const RECEIVE: Self = Self(1 << 1);
     pub const CANCEL: Self = Self(1 << 2);
+    pub const DELEGATE: Self = Self(1 << 3);
     pub const SEND_RECEIVE: Self = Self(Self::SEND.0 | Self::RECEIVE.0);
-    pub const ALL: Self = Self(Self::SEND_RECEIVE.0 | Self::CANCEL.0);
+    pub const SEND_CANCEL: Self = Self(Self::SEND.0 | Self::CANCEL.0);
+    pub const SEND_DELEGATE: Self = Self(Self::SEND.0 | Self::DELEGATE.0);
+    pub const SEND_CANCEL_DELEGATE: Self = Self(Self::SEND.0 | Self::CANCEL.0 | Self::DELEGATE.0);
+    pub const ALL: Self = Self(Self::SEND_RECEIVE.0 | Self::CANCEL.0 | Self::DELEGATE.0);
 
     pub const fn bits(self) -> u8 {
         self.0
     }
 
-    const fn valid(self) -> bool {
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        let rights = Self(bits);
+        if rights.valid() {
+            Some(rights)
+        } else {
+            None
+        }
+    }
+
+    pub const fn valid(self) -> bool {
         self.0 != 0 && self.0 & !Self::ALL.0 == 0
     }
 
-    const fn contains(self, required: Self) -> bool {
+    pub const fn contains(self, required: Self) -> bool {
         self.0 & required.0 == required.0
     }
 }
@@ -52,6 +65,7 @@ pub enum IpcError {
     Timeout,
     Cancelled,
     NotWaiting,
+    RightsEscalation,
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +73,8 @@ pub struct Delivery {
     pub sender: u64,
     pub length: u64,
     pub sequence: u64,
+    pub capability_handle: u64,
+    pub capability_rights: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +117,10 @@ pub struct Snapshot {
     pub last_capability_generation: u64,
     pub cancellation_requests: u64,
     pub cancellation_successes: u64,
+    pub capability_transfers: u64,
+    pub capability_transfer_failures: u64,
+    pub rights_attenuations: u64,
+    pub last_transferred_rights: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +156,8 @@ struct Message {
     sender: u64,
     length: usize,
     sequence: u64,
+    capability_handle: u64,
+    capability_rights: u8,
     bytes: [u8; MAX_MESSAGE_BYTES],
 }
 
@@ -145,6 +167,8 @@ impl Message {
             sender: 0,
             length: 0,
             sequence: 0,
+            capability_handle: 0,
+            capability_rights: 0,
             bytes: [0; MAX_MESSAGE_BYTES],
         }
     }
@@ -224,6 +248,10 @@ struct IpcState {
     last_capability_generation: u64,
     cancellation_requests: u64,
     cancellation_successes: u64,
+    capability_transfers: u64,
+    capability_transfer_failures: u64,
+    rights_attenuations: u64,
+    last_transferred_rights: u64,
 }
 
 impl IpcState {
@@ -250,6 +278,10 @@ impl IpcState {
             last_capability_generation: 0,
             cancellation_requests: 0,
             cancellation_successes: 0,
+            capability_transfers: 0,
+            capability_transfer_failures: 0,
+            rights_attenuations: 0,
+            last_transferred_rights: 0,
         }
     }
 
@@ -396,6 +428,15 @@ impl IpcState {
         handle: u64,
         required: CapabilityRights,
     ) -> Result<u64, IpcError> {
+        Ok(self.resolve_capability(owner, handle, required)?.target)
+    }
+
+    fn resolve_capability(
+        &mut self,
+        owner: u64,
+        handle: u64,
+        required: CapabilityRights,
+    ) -> Result<Capability, IpcError> {
         let Some(owner_index) = self.find(owner) else {
             return Err(IpcError::EndpointMissing);
         };
@@ -417,7 +458,7 @@ impl IpcState {
             self.record_denial(true);
             return Err(IpcError::StaleCapability);
         }
-        Ok(capability.target)
+        Ok(capability)
     }
 
     fn send_capability(
@@ -429,6 +470,105 @@ impl IpcState {
         let receiver = self.resolve(sender, handle, CapabilityRights::SEND)?;
         let (sequence, waiting) = self.send(sender, receiver, bytes)?;
         Ok((sequence, waiting, receiver))
+    }
+
+    fn send_with_capability(
+        &mut self,
+        sender: u64,
+        destination_handle: u64,
+        transfer_handle: u64,
+        requested_rights: CapabilityRights,
+        bytes: &[u8],
+    ) -> Result<(u64, bool, u64, u64), IpcError> {
+        let result = self.try_send_with_capability(
+            sender,
+            destination_handle,
+            transfer_handle,
+            requested_rights,
+            bytes,
+        );
+        if result.is_err() {
+            self.capability_transfer_failures = self.capability_transfer_failures.saturating_add(1);
+        }
+        result
+    }
+
+    fn try_send_with_capability(
+        &mut self,
+        sender: u64,
+        destination_handle: u64,
+        transfer_handle: u64,
+        requested_rights: CapabilityRights,
+        bytes: &[u8],
+    ) -> Result<(u64, bool, u64, u64), IpcError> {
+        if !requested_rights.valid() {
+            self.record_denial(false);
+            return Err(IpcError::InvalidRights);
+        }
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err(IpcError::MessageTooLarge);
+        }
+
+        let receiver = self.resolve(sender, destination_handle, CapabilityRights::SEND)?;
+        let source =
+            self.resolve_capability(sender, transfer_handle, CapabilityRights::DELEGATE)?;
+        if !source.rights.contains(requested_rights) {
+            self.record_denial(false);
+            return Err(IpcError::RightsEscalation);
+        }
+        if requested_rights.contains(CapabilityRights::RECEIVE) && receiver != source.target {
+            self.record_denial(false);
+            return Err(IpcError::InvalidRights);
+        }
+
+        let Some(receiver_index) = self.find(receiver) else {
+            return Err(IpcError::EndpointMissing);
+        };
+        if self.endpoints[receiver_index].len >= QUEUE_DEPTH {
+            self.queue_full_events = self.queue_full_events.saturating_add(1);
+            return Err(IpcError::QueueFull);
+        }
+        let Some(recipient_slot) = self.endpoints[receiver_index]
+            .capabilities
+            .iter()
+            .position(|capability| !capability.active)
+        else {
+            return Err(IpcError::CapabilityCapacity);
+        };
+
+        let sequence = self.next_sequence;
+        let generation = self.allocate_generation();
+        let recipient_handle = encode_handle(recipient_slot, generation);
+        let mut message = Message::empty();
+        message.sender = sender;
+        message.length = bytes.len();
+        message.sequence = sequence;
+        message.capability_handle = recipient_handle;
+        message.capability_rights = requested_rights.bits();
+        message.bytes[..bytes.len()].copy_from_slice(bytes);
+
+        let waiting = self.endpoints[receiver_index].waiting;
+        self.endpoints[receiver_index].capabilities[recipient_slot] = Capability {
+            target: source.target,
+            generation,
+            rights: requested_rights,
+            active: true,
+        };
+        if !self.endpoints[receiver_index].push(message) {
+            self.endpoints[receiver_index].capabilities[recipient_slot] = Capability::empty();
+            return Err(IpcError::QueueFull);
+        }
+        self.endpoints[receiver_index].waiting = false;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.messages_sent = self.messages_sent.saturating_add(1);
+        self.last_sequence = sequence;
+        self.capabilities_granted = self.capabilities_granted.saturating_add(1);
+        self.capability_transfers = self.capability_transfers.saturating_add(1);
+        if requested_rights.bits() != source.rights.bits() {
+            self.rights_attenuations = self.rights_attenuations.saturating_add(1);
+        }
+        self.last_transferred_rights = requested_rights.bits() as u64;
+        Ok((sequence, waiting, receiver, recipient_handle))
     }
 
     fn can_receive(&mut self, receiver: u64) -> Result<(), IpcError> {
@@ -513,6 +653,8 @@ impl IpcState {
             sender: message.sender,
             length: message.length as u64,
             sequence: message.sequence,
+            capability_handle: message.capability_handle,
+            capability_rights: message.capability_rights,
         })
     }
 
@@ -606,6 +748,10 @@ impl IpcState {
             last_capability_generation: self.last_capability_generation,
             cancellation_requests: self.cancellation_requests,
             cancellation_successes: self.cancellation_successes,
+            capability_transfers: self.capability_transfers,
+            capability_transfer_failures: self.capability_transfer_failures,
+            rights_attenuations: self.rights_attenuations,
+            last_transferred_rights: self.last_transferred_rights,
         }
     }
 
@@ -617,6 +763,7 @@ impl IpcState {
                 .all(|endpoint| endpoint.len <= QUEUE_DEPTH && endpoint.head < QUEUE_DEPTH)
             && endpoint_owners_unique(&self.endpoints)
             && capability_tables_valid(&self.endpoints)
+            && queued_capabilities_valid(&self.endpoints)
     }
 }
 
@@ -687,28 +834,54 @@ pub fn clear_waiting(task_id: u64) -> Result<(), IpcError> {
 }
 
 pub fn send(sender: u64, receiver: u64, bytes: &[u8]) -> Result<u64, IpcError> {
-    let (sequence, wake_receiver) =
-        cpu_interrupts::without_interrupts(|| state_mut().send(sender, receiver, bytes))?;
-    finish_send(sequence, wake_receiver, receiver)
+    cpu_interrupts::without_interrupts(|| {
+        let (sequence, wake_receiver) = state_mut().send(sender, receiver, bytes)?;
+        finish_send_locked(sequence, wake_receiver, receiver)
+    })
 }
 
 pub fn send_capability(sender: u64, handle: u64, bytes: &[u8]) -> Result<u64, IpcError> {
-    let (sequence, wake_receiver, receiver) =
-        cpu_interrupts::without_interrupts(|| state_mut().send_capability(sender, handle, bytes))?;
-    finish_send(sequence, wake_receiver, receiver)
+    cpu_interrupts::without_interrupts(|| {
+        let (sequence, wake_receiver, receiver) =
+            state_mut().send_capability(sender, handle, bytes)?;
+        finish_send_locked(sequence, wake_receiver, receiver)
+    })
 }
 
-fn finish_send(sequence: u64, wake_receiver: bool, receiver: u64) -> Result<u64, IpcError> {
+pub fn send_with_capability(
+    sender: u64,
+    destination_handle: u64,
+    transfer_handle: u64,
+    requested_rights: CapabilityRights,
+    bytes: &[u8],
+) -> Result<u64, IpcError> {
+    cpu_interrupts::without_interrupts(|| {
+        let (sequence, wake_receiver, receiver, recipient_handle) = state_mut()
+            .send_with_capability(
+                sender,
+                destination_handle,
+                transfer_handle,
+                requested_rights,
+                bytes,
+            )?;
+        finish_send_locked(sequence, wake_receiver, receiver)?;
+        serial::log_hex_u64("ipc-cap", "transferred handle", recipient_handle);
+        serial::log_hex_u64(
+            "ipc-cap",
+            "transferred rights",
+            requested_rights.bits() as u64,
+        );
+        Ok(sequence)
+    })
+}
+
+fn finish_send_locked(sequence: u64, wake_receiver: bool, receiver: u64) -> Result<u64, IpcError> {
     if wake_receiver {
         if process::wake_from_ipc(receiver) {
-            cpu_interrupts::without_interrupts(|| {
-                let state = state_mut();
-                state.receiver_wakeups = state.receiver_wakeups.saturating_add(1);
-            });
+            let state = state_mut();
+            state.receiver_wakeups = state.receiver_wakeups.saturating_add(1);
         } else {
-            cpu_interrupts::without_interrupts(|| {
-                let _ = state_mut().set_waiting(receiver, true);
-            });
+            let _ = state_mut().set_waiting(receiver, true);
             return Err(IpcError::WakeFailed);
         }
     }
@@ -793,6 +966,7 @@ pub fn error_code(error: IpcError) -> u64 {
         IpcError::Timeout => 16,
         IpcError::Cancelled => 17,
         IpcError::NotWaiting => 18,
+        IpcError::RightsEscalation => 19,
     }
 }
 
@@ -816,6 +990,7 @@ pub fn error_name(error: IpcError) -> &'static str {
         IpcError::Timeout => "receive timeout",
         IpcError::Cancelled => "receive cancelled",
         IpcError::NotWaiting => "receiver is not waiting",
+        IpcError::RightsEscalation => "capability rights escalation",
     }
 }
 
@@ -846,7 +1021,8 @@ fn model_selftest() -> bool {
             Ok(Delivery {
                 sender: 1,
                 length: 4,
-                sequence: 1
+                sequence: 1,
+                ..
             })
         )
         && &output[..4] == b"ping"
@@ -856,6 +1032,98 @@ fn model_selftest() -> bool {
         && state.unregister(1).is_ok()
         && state.unregister(2).is_ok()
         && state.snapshot().active_endpoints == 0
+        && state.invariants()
+        && transfer_model_selftest()
+}
+
+fn transfer_model_selftest() -> bool {
+    let mut state = IpcState::new();
+    state.init();
+    if state.register(1).is_err() || state.register(2).is_err() || state.register(3).is_err() {
+        return false;
+    }
+
+    let Ok(destination) = state.grant(1, 2, CapabilityRights::SEND) else {
+        return false;
+    };
+    let Ok(source) = state.grant(1, 3, CapabilityRights::SEND_DELEGATE) else {
+        return false;
+    };
+    let Ok((sequence, waiting, receiver, _)) =
+        state.send_with_capability(1, destination, source, CapabilityRights::SEND, b"grant")
+    else {
+        return false;
+    };
+    let mut output = [0u8; MAX_MESSAGE_BYTES];
+    let Ok(delivery) = state.receive(2, &mut output) else {
+        return false;
+    };
+    let attenuated = sequence == 1
+        && !waiting
+        && receiver == 2
+        && delivery.capability_handle != 0
+        && delivery.capability_rights == CapabilityRights::SEND.bits()
+        && state.resolve(2, delivery.capability_handle, CapabilityRights::SEND) == Ok(3)
+        && state.resolve(2, delivery.capability_handle, CapabilityRights::CANCEL)
+            == Err(IpcError::PermissionDenied)
+        && &output[..5] == b"grant";
+    let delegation_denied = state.send_with_capability(
+        1,
+        destination,
+        destination,
+        CapabilityRights::SEND,
+        b"delegate",
+    ) == Err(IpcError::PermissionDenied);
+    let escalation_denied = state.send_with_capability(
+        1,
+        destination,
+        source,
+        CapabilityRights::SEND_CANCEL,
+        b"escalate",
+    ) == Err(IpcError::RightsEscalation);
+
+    for index in 0..QUEUE_DEPTH {
+        if state
+            .send_capability(1, destination, &[index as u8])
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let caps_before_full_queue = state.snapshot().active_capabilities;
+    let queue_full_atomic =
+        state.send_with_capability(1, destination, source, CapabilityRights::SEND, b"full")
+            == Err(IpcError::QueueFull)
+            && state.snapshot().active_capabilities == caps_before_full_queue;
+    for _ in 0..QUEUE_DEPTH {
+        if state.receive(2, &mut output).is_err() {
+            return false;
+        }
+    }
+
+    while state.endpoints[state.find(2).unwrap_or(0)]
+        .capabilities
+        .iter()
+        .any(|capability| !capability.active)
+    {
+        if state.grant(2, 3, CapabilityRights::SEND).is_err() {
+            return false;
+        }
+    }
+    let queued_before_full_table = state.snapshot().queued_messages;
+    let table_full_atomic =
+        state.send_with_capability(1, destination, source, CapabilityRights::SEND, b"no-slot")
+            == Err(IpcError::CapabilityCapacity)
+            && state.snapshot().queued_messages == queued_before_full_table;
+
+    attenuated
+        && delegation_denied
+        && escalation_denied
+        && queue_full_atomic
+        && table_full_atomic
+        && state.snapshot().capability_transfers == 1
+        && state.snapshot().rights_attenuations == 1
+        && state.snapshot().capability_transfer_failures == 4
         && state.invariants()
 }
 
@@ -907,6 +1175,34 @@ fn capability_tables_valid(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
                 || !endpoints
                     .iter()
                     .any(|target| target.owner == capability.target)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn queued_capabilities_valid(endpoints: &[Endpoint; MAX_ENDPOINTS]) -> bool {
+    for endpoint in endpoints.iter() {
+        if endpoint.owner == 0 {
+            continue;
+        }
+        for offset in 0..endpoint.len {
+            let message = endpoint.queue[(endpoint.head + offset) % QUEUE_DEPTH];
+            if message.capability_handle == 0 {
+                if message.capability_rights != 0 {
+                    return false;
+                }
+                continue;
+            }
+            let Some((slot, generation)) = decode_handle(message.capability_handle) else {
+                return false;
+            };
+            let capability = endpoint.capabilities[slot];
+            if !capability.active
+                || capability.generation != generation
+                || capability.rights.bits() != message.capability_rights
             {
                 return false;
             }
